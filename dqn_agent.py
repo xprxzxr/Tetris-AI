@@ -115,6 +115,8 @@ class DQNAgent:
         self._gpu_rewards = torch.zeros(mem_size, device=DEVICE)
         self._gpu_dones = torch.zeros(mem_size, dtype=torch.bool, device=DEVICE)
         self._gpu_priorities = torch.ones(mem_size, device=DEVICE)
+        self._ranked_indices = None
+        self._rank_refresh = 500  # Re-sort priorities every N train() calls
         self._mem_pos = 0
         self._mem_count = 0  # How many valid entries (up to mem_size)
 
@@ -202,23 +204,49 @@ class DQNAgent:
         values = self.model(states_t)
         return states[torch.argmax(values).item()]
 
+    def _per_sample(self, batch_size):
+        '''Rank-based PER sampling — O(batch_size), not O(buffer_size).
+        Splits buffer into batch_size segments by priority rank,
+        samples one index from each segment. Much faster than
+        torch.multinomial on large buffers.'''
+        n = self._mem_count
+
+        # Sort priorities to get rank order (descending — highest priority first)
+        # Only recompute ranks periodically to amortize sort cost
+        if (self._train_steps % self._rank_refresh == 0
+                or self._ranked_indices is None
+                or len(self._ranked_indices) != n):
+            self._ranked_indices = torch.argsort(
+                self._gpu_priorities[:n], descending=True)
+
+        # Split into batch_size segments, sample one random position per segment
+        segment_size = n / batch_size
+        offsets = torch.arange(batch_size, device=DEVICE, dtype=torch.float32)
+        # Random position within each segment
+        rand_offsets = torch.rand(batch_size, device=DEVICE) * segment_size
+        raw_positions = (offsets * segment_size + rand_offsets).long().clamp(0, n - 1)
+        indices = self._ranked_indices[raw_positions]
+
+        # Approximate IS weights from rank position
+        beta = min(1.0, self.per_beta + (self.per_beta_end - self.per_beta)
+                   * self._train_steps / self.per_beta_anneal)
+        # Rank-based probability: P(i) proportional to 1/rank^alpha
+        ranks = (raw_positions.float() + 1.0)  # 1-indexed rank
+        rank_probs = (1.0 / ranks) ** self.per_alpha
+        rank_probs = rank_probs / rank_probs.sum()
+        is_weights = (n * rank_probs) ** (-beta)
+        is_weights = is_weights / is_weights.max()
+
+        return indices, is_weights
+
     def train(self, batch_size=32, epochs=1):
-        '''Train on GPU with Prioritized Experience Replay.'''
+        '''Train on GPU with rank-based PER + n-step + soft target update.'''
         n = self._mem_count
         if n < self.replay_start_size or n < batch_size:
             return
 
-        # ── PER: weighted sampling ──
-        priorities = self._gpu_priorities[:n]
-        probs = priorities ** self.per_alpha
-        probs = probs / probs.sum()
-        indices = torch.multinomial(probs, batch_size, replacement=False)
-
-        # Importance sampling weights (correct PER bias)
-        beta = min(1.0, self.per_beta + (self.per_beta_end - self.per_beta)
-                   * self._train_steps / self.per_beta_anneal)
-        is_weights = (n * probs[indices]) ** (-beta)
-        is_weights = is_weights / is_weights.max()
+        # ── PER: rank-based segment sampling (fast) ──
+        indices, is_weights = self._per_sample(batch_size)
 
         # Index directly into GPU tensors — zero copy
         states = self._gpu_states[indices]
@@ -251,10 +279,11 @@ class DQNAgent:
         self.scheduler.step()
         self._train_steps += 1
 
-        # Soft (Polyak) target update — smoother than hard copy every N steps
-        tau = 0.005
-        for p_target, p_online in zip(self.target_model.parameters(), self.model.parameters()):
-            p_target.data.mul_(1.0 - tau).add_(p_online.data * tau)
+        # Soft (Polyak) target update every 10 steps — amortizes the Python loop cost
+        if self._train_steps % 10 == 0:
+            tau = 0.05  # 10× larger tau since we update 10× less often (equivalent smoothing)
+            for p_target, p_online in zip(self.target_model.parameters(), self.model.parameters()):
+                p_target.data.mul_(1.0 - tau).add_(p_online.data * tau)
 
         if self.epsilon > self.epsilon_min:
             self.epsilon -= self.epsilon_decay
