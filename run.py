@@ -549,11 +549,12 @@ def dqn(resume_from=None, fast_mode=False):
     #   RTX 4070 VRAM typically: 405-10501 MHz
     #   Example: mem_clock_min=5001, mem_clock_max=5001 for fixed VRAM speed
     if fast_mode:
-        # Fast mode: no GPU throttling, no clock locking, max training speed
+        # Fast mode: lock GPU clocks HIGH so it never downclocks between bursts
+        # RTX 3090: ~1800 MHz core, 9751 MHz memory
         governor = GPUGovernor(target_high=1.0, burst=100, cooldown=0.0,
                                batch_size=batch_size,
-                               clock_min=None, clock_max=None,
-                               mem_clock_min=None, mem_clock_max=None)
+                               clock_min=1700, clock_max=1900,
+                               mem_clock_min=9501, mem_clock_max=9751)
     else:
         governor = GPUGovernor(target_high=0.70, burst=20, cooldown=0.01,
                                batch_size=batch_size,

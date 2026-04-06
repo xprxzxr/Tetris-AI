@@ -116,7 +116,8 @@ class DQNAgent:
         self._gpu_dones = torch.zeros(mem_size, dtype=torch.bool, device=DEVICE)
         self._gpu_priorities = torch.ones(mem_size, device=DEVICE)
         self._ranked_indices = None
-        self._rank_refresh = 500  # Re-sort priorities every N train() calls
+        self._rank_refresh = 2000  # Re-sort priorities every N train() calls
+        self._last_ranked_count = 0
         self._mem_pos = 0
         self._mem_count = 0  # How many valid entries (up to mem_size)
 
@@ -212,12 +213,15 @@ class DQNAgent:
         n = self._mem_count
 
         # Sort priorities to get rank order (descending — highest priority first)
-        # Only recompute ranks periodically to amortize sort cost
+        # Only recompute ranks periodically to amortize sort cost.
+        # Also refresh when buffer has grown by >20% since last sort.
+        buffer_grew = (n > self._last_ranked_count * 1.2)
         if (self._train_steps % self._rank_refresh == 0
                 or self._ranked_indices is None
-                or len(self._ranked_indices) != n):
+                or buffer_grew):
             self._ranked_indices = torch.argsort(
                 self._gpu_priorities[:n], descending=True)
+            self._last_ranked_count = n
 
         # Split into batch_size segments, sample one random position per segment
         segment_size = n / batch_size
