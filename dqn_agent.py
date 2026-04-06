@@ -115,9 +115,6 @@ class DQNAgent:
         self._gpu_rewards = torch.zeros(mem_size, device=DEVICE)
         self._gpu_dones = torch.zeros(mem_size, dtype=torch.bool, device=DEVICE)
         self._gpu_priorities = torch.ones(mem_size, device=DEVICE)
-        self._ranked_indices = None
-        self._rank_refresh = 2000  # Re-sort priorities every N train() calls
-        self._last_ranked_count = 0
         self._mem_pos = 0
         self._mem_count = 0  # How many valid entries (up to mem_size)
 
@@ -206,39 +203,41 @@ class DQNAgent:
         return states[torch.argmax(values).item()]
 
     def _per_sample(self, batch_size):
-        '''Rank-based PER sampling — O(batch_size), not O(buffer_size).
-        Splits buffer into batch_size segments by priority rank,
-        samples one index from each segment. Much faster than
-        torch.multinomial on large buffers.'''
+        '''Priority sampling using top-k biased random indices.
+        Fast and safe — no sort, no multinomial, no index-out-of-bounds.'''
         n = self._mem_count
 
-        # Sort priorities to get rank order (descending — highest priority first)
-        # Only recompute ranks periodically to amortize sort cost.
-        # Also refresh when buffer has grown by >20% since last sort.
-        buffer_grew = (n > self._last_ranked_count * 1.2)
-        if (self._train_steps % self._rank_refresh == 0
-                or self._ranked_indices is None
-                or buffer_grew):
-            self._ranked_indices = torch.argsort(
-                self._gpu_priorities[:n], descending=True)
-            self._last_ranked_count = n
+        # Simple approach: sample with replacement weighted by priority
+        # Use priorities as weights directly with torch.multinomial on a CLAMPED slice
+        priorities = self._gpu_priorities[:n].clamp(min=1e-8)
 
-        # Split into batch_size segments, sample one random position per segment
-        segment_size = n / batch_size
-        offsets = torch.arange(batch_size, device=DEVICE, dtype=torch.float32)
-        # Random position within each segment
-        rand_offsets = torch.rand(batch_size, device=DEVICE) * segment_size
-        raw_positions = (offsets * segment_size + rand_offsets).long().clamp(0, n - 1)
-        indices = self._ranked_indices[raw_positions]
+        # If buffer is small, just use uniform sampling (fast path)
+        if n <= batch_size * 2:
+            indices = torch.randint(0, n, (batch_size,), device=DEVICE)
+            return indices, torch.ones(batch_size, device=DEVICE)
 
-        # Approximate IS weights from rank position
+        # Stochastic priority sampling: mix priority-weighted and uniform
+        # Draw half from top priorities, half uniform — fast and effective
+        half = batch_size // 2
+
+        # Top-priority half: sample from top 20% of buffer by priority
+        top_k = max(batch_size, n // 5)
+        top_vals, top_idx = torch.topk(priorities, top_k, sorted=False)
+        chosen = torch.randint(0, top_k, (half,), device=DEVICE)
+        priority_indices = top_idx[chosen]
+
+        # Uniform half: random indices for diversity
+        uniform_indices = torch.randint(0, n, (batch_size - half,), device=DEVICE)
+
+        # Combine
+        indices = torch.cat([priority_indices, uniform_indices])
+
+        # IS weights: priority samples get downweighted, uniform get weight 1.0
         beta = min(1.0, self.per_beta + (self.per_beta_end - self.per_beta)
                    * self._train_steps / self.per_beta_anneal)
-        # Rank-based probability: P(i) proportional to 1/rank^alpha
-        ranks = (raw_positions.float() + 1.0)  # 1-indexed rank
-        rank_probs = (1.0 / ranks) ** self.per_alpha
-        rank_probs = rank_probs / rank_probs.sum()
-        is_weights = (n * rank_probs) ** (-beta)
+        sampled_priorities = priorities[indices]
+        mean_priority = priorities.mean()
+        is_weights = (mean_priority / sampled_priorities) ** beta
         is_weights = is_weights / is_weights.max()
 
         return indices, is_weights
