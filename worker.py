@@ -15,8 +15,35 @@ from tetris import Tetris
 from multiprocessing import Process, Queue
 
 
+def _compute_nstep(experiences, n_step, discount):
+    '''Convert 1-step experiences to n-step returns. CPU-side, per episode.'''
+    if n_step <= 1:
+        return experiences
+    n = len(experiences)
+    result = []
+    for i in range(n):
+        R = 0.0
+        gamma_power = 1.0
+        end_idx = i
+        for k in range(n_step):
+            idx = i + k
+            if idx >= n:
+                break
+            _, _, r_k, d_k = experiences[idx]
+            R += gamma_power * r_k
+            gamma_power *= discount
+            end_idx = idx
+            if d_k:
+                break
+        s_i = experiences[i][0]
+        s_end = experiences[end_idx][1]
+        done_end = experiences[end_idx][3]
+        result.append((s_i, s_end, R, done_end))
+    return result
+
+
 def _worker_loop(task_queue, result_queue, inference_queue, response_queues, worker_id,
-                 step_throttle=0.0):
+                 step_throttle=0.0, n_step=3, discount=0.95):
     '''Persistent worker — plays Tetris games, sends states to GPU for evaluation.
     No local model. All inference happens on GPU via queues.'''
     env = Tetris()
@@ -74,7 +101,7 @@ def _worker_loop(task_queue, result_queue, inference_queue, response_queues, wor
                 if step_throttle > 0:
                     _time.sleep(step_throttle)
 
-            all_experiences.extend(experiences)
+            all_experiences.extend(_compute_nstep(experiences, n_step, discount))
             all_scores.append(env.get_game_score())
             all_steps.append(steps)
 
@@ -86,7 +113,7 @@ class WorkerPool:
     Workers send candidate states to GPU via inference_queue.
     GPU inference thread (in run.py) evaluates and returns results.'''
 
-    def __init__(self, num_workers, step_throttle=0.0):
+    def __init__(self, num_workers, step_throttle=0.0, n_step=3, discount=0.95):
         self.num_workers = num_workers
         self.task_queue = Queue()
         self.result_queue = Queue()
@@ -100,7 +127,7 @@ class WorkerPool:
             p = Process(target=_worker_loop,
                         args=(self.task_queue, self.result_queue,
                               self.inference_queue, self.response_queues, i,
-                              step_throttle),
+                              step_throttle, n_step, discount),
                         daemon=True)
             p.start()
             self.workers.append(p)

@@ -52,7 +52,8 @@ class DQNAgent:
     def __init__(self, state_size, mem_size=10000, discount=0.95,
                  epsilon=1, epsilon_min=0, epsilon_stop_episode=0,
                  n_neurons=[32, 32], activations=['relu', 'relu', 'linear'],
-                 lr=1e-3, replay_start_size=None, modelFile=None):
+                 lr=1e-3, replay_start_size=None, modelFile=None,
+                 n_step=1, per_alpha=0.6, per_beta=0.4):
 
         if len(activations) != len(n_neurons) + 1:
             raise ValueError(f"Expected activations list of length {len(n_neurons) + 1}")
@@ -76,6 +77,18 @@ class DQNAgent:
             replay_start_size = mem_size / 2
         self.replay_start_size = replay_start_size
 
+        # N-step returns
+        self.n_step = n_step
+        self.discount_n = discount ** n_step
+
+        # Prioritized Experience Replay
+        self.per_alpha = per_alpha
+        self.per_beta = per_beta
+        self.per_beta_end = 1.0
+        self.per_beta_anneal = 200000
+        self.per_epsilon = 1e-6
+        self._max_priority = 1.0
+
         if modelFile is not None:
             self.model = DQNModel(state_size, n_neurons, activations).to(DEVICE)
             self.model.load_state_dict(torch.load(modelFile, map_location=DEVICE, weights_only=True))
@@ -87,14 +100,13 @@ class DQNAgent:
         self.target_model.load_state_dict(self.model.state_dict())
         self.target_model.eval()
         self._train_steps = 0
-        self.target_update_freq = 1000  # Hard-update target every N train() calls
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         # Cosine anneal over ~200k train() calls — never fully kills the LR
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=200000, eta_min=1e-5
         )
-        self.loss_fn = nn.SmoothL1Loss()  # Huber loss — robust to reward outliers
+        self.loss_fn = nn.SmoothL1Loss(reduction='none')  # Element-wise for PER weighting
 
         # ── GPU-resident replay buffer ──────────────────────────────
         # Pre-allocated on GPU. No CPU→GPU transfer during training.
@@ -102,6 +114,7 @@ class DQNAgent:
         self._gpu_next_states = torch.zeros(mem_size, state_size, device=DEVICE)
         self._gpu_rewards = torch.zeros(mem_size, device=DEVICE)
         self._gpu_dones = torch.zeros(mem_size, dtype=torch.bool, device=DEVICE)
+        self._gpu_priorities = torch.ones(mem_size, device=DEVICE)
         self._mem_pos = 0
         self._mem_count = 0  # How many valid entries (up to mem_size)
 
@@ -154,6 +167,7 @@ class DQNAgent:
             self._gpu_next_states[start:start + n] = next_t
             self._gpu_rewards[start:start + n] = rewards_t
             self._gpu_dones[start:start + n] = dones_t
+            self._gpu_priorities[start:start + n] = self._max_priority
         else:
             # Wraparound — two slices
             first = self.mem_size - start
@@ -161,12 +175,14 @@ class DQNAgent:
             self._gpu_next_states[start:] = next_t[:first]
             self._gpu_rewards[start:] = rewards_t[:first]
             self._gpu_dones[start:] = dones_t[:first]
+            self._gpu_priorities[start:] = self._max_priority
 
             remainder = n - first
             self._gpu_states[:remainder] = states_t[first:]
             self._gpu_next_states[:remainder] = next_t[first:]
             self._gpu_rewards[:remainder] = rewards_t[first:]
             self._gpu_dones[:remainder] = dones_t[first:]
+            self._gpu_priorities[:remainder] = self._max_priority
 
         self._mem_pos = (start + n) % self.mem_size
         self._mem_count = min(self._mem_count + n, self.mem_size)
@@ -187,13 +203,22 @@ class DQNAgent:
         return states[torch.argmax(values).item()]
 
     def train(self, batch_size=32, epochs=1):
-        '''Train entirely on GPU — no CPU involvement in the hot loop.'''
+        '''Train on GPU with Prioritized Experience Replay.'''
         n = self._mem_count
         if n < self.replay_start_size or n < batch_size:
             return
 
-        # Sample random indices ON GPU
-        indices = torch.randint(0, n, (batch_size,), device=DEVICE)
+        # ── PER: weighted sampling ──
+        priorities = self._gpu_priorities[:n]
+        probs = priorities ** self.per_alpha
+        probs = probs / probs.sum()
+        indices = torch.multinomial(probs, batch_size, replacement=False)
+
+        # Importance sampling weights (correct PER bias)
+        beta = min(1.0, self.per_beta + (self.per_beta_end - self.per_beta)
+                   * self._train_steps / self.per_beta_anneal)
+        is_weights = (n * probs[indices]) ** (-beta)
+        is_weights = is_weights / is_weights.max()
 
         # Index directly into GPU tensors — zero copy
         states = self._gpu_states[indices]
@@ -205,21 +230,31 @@ class DQNAgent:
             with torch.no_grad():
                 next_qs = self.target_model(next_states).squeeze()
 
-            targets = torch.where(dones, rewards, rewards + self.discount * next_qs)
+            targets = torch.where(dones, rewards, rewards + self.discount_n * next_qs)
             predictions = self.model(states).squeeze()
 
-            loss = self.loss_fn(predictions, targets)
+            # PER-weighted loss
+            element_loss = self.loss_fn(predictions, targets)
+            loss = (is_weights * element_loss).mean()
+
             self.optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
+        # ── Update priorities ──
+        with torch.no_grad():
+            td_errors = (predictions - targets).abs() + self.per_epsilon
+            self._gpu_priorities[indices] = td_errors
+            self._max_priority = max(self._max_priority, td_errors.max().item())
+
         self.scheduler.step()
         self._train_steps += 1
 
-        # Hard-update target network periodically
-        if self._train_steps % self.target_update_freq == 0:
-            self.target_model.load_state_dict(self.model.state_dict())
+        # Soft (Polyak) target update — smoother than hard copy every N steps
+        tau = 0.005
+        for p_target, p_online in zip(self.target_model.parameters(), self.model.parameters()):
+            p_target.data.mul_(1.0 - tau).add_(p_online.data * tau)
 
         if self.epsilon > self.epsilon_min:
             self.epsilon -= self.epsilon_decay
@@ -244,6 +279,8 @@ class DQNAgent:
             'mem_count': self._mem_count,
             'episode': episode,
             'best_score': best_score,
+            'per_max_priority': self._max_priority,
+            'n_step': self.n_step,
         }, path)
 
     def load_checkpoint(self, path):
@@ -259,6 +296,12 @@ class DQNAgent:
         self._train_steps = ckpt['train_steps']
         self._mem_pos = ckpt.get('mem_pos', 0)
         self._mem_count = ckpt.get('mem_count', 0)
+        self._max_priority = ckpt.get('per_max_priority', 1.0)
+        if self._mem_count > 0:
+            self._gpu_priorities[:self._mem_count] = self._max_priority
+        saved_n = ckpt.get('n_step', 1)
+        if saved_n != self.n_step:
+            print(f"[WARN] Checkpoint was n_step={saved_n}, now using n_step={self.n_step}")
         self._weights_dirty = True
         return ckpt.get('episode', 0), ckpt.get('best_score', 0)
 

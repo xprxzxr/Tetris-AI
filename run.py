@@ -474,6 +474,7 @@ def dqn(resume_from=None, fast_mode=False):
     epsilon_stop_episode = 35000  # Explore for 70% of training
     mem_size = 200000 if fast_mode else 100000
     discount = 0.95  # Focus on near-term rewards (line clears)
+    n_step = 3  # N-step returns — propagates reward 3 steps back per update
     batch_size = 2048  # Sweet spot — bigger wastes GPU on a small model
     render_every = None
     render_delay = None
@@ -488,7 +489,8 @@ def dqn(resume_from=None, fast_mode=False):
                      n_neurons=n_neurons, activations=activations,
                      epsilon_stop_episode=epsilon_stop_episode, epsilon_min=0.01,
                      mem_size=mem_size,
-                     discount=discount, replay_start_size=replay_start_size, lr=lr)
+                     discount=discount, replay_start_size=replay_start_size, lr=lr,
+                     n_step=n_step)
 
     # ── Resume from checkpoint ─────────────────────────────────
     scores = []
@@ -513,7 +515,8 @@ def dqn(resume_from=None, fast_mode=False):
     episode = start_episode
     pbar = tqdm(total=episodes, initial=start_episode, desc="Training")
 
-    pool = WorkerPool(NUM_WORKERS, step_throttle=STEP_THROTTLE)
+    pool = WorkerPool(NUM_WORKERS, step_throttle=STEP_THROTTLE,
+                      n_step=n_step, discount=discount)
 
     # ── Live Dashboard ───────────────────────────────��──────────────
     dashboard_data = {
