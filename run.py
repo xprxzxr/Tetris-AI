@@ -477,8 +477,12 @@ def dqn(resume_from=None, fast_mode=False):
     render_delay = None
     log_every = 50
     replay_start_size = 5000  # More diverse initial buffer
+    # Big model — trains on GPU, saved as best.pt
     n_neurons = [2048, 1536, 768, 384]
     activations = ['relu', 'relu', 'relu', 'relu', 'linear']
+    # Small model — runs on CPU in workers for fast action selection
+    worker_neurons = [512, 512, 256]
+    worker_activations = ['relu', 'relu', 'relu', 'linear']
     lr = 1e-3
     save_best_model = True
 
@@ -512,10 +516,35 @@ def dqn(resume_from=None, fast_mode=False):
     episode = start_episode
     pbar = tqdm(total=episodes, initial=start_episode, desc="Training")
 
-    init_weights = agent.get_weights()
-    pool = WorkerPool(NUM_WORKERS, init_weights,
+    # Small explorer model on GPU — periodically trained to mimic the big model
+    from dqn_agent import DQNModel, DEVICE
+    explorer_model = DQNModel(env.get_state_size(), worker_neurons, worker_activations).to(DEVICE)
+    explorer_optimizer = torch.optim.Adam(explorer_model.parameters(), lr=5e-3)
+
+    def _sync_explorer():
+        '''Distill big model → small explorer model using replay buffer data.'''
+        n = agent._mem_count
+        if n < 5000:
+            return
+        # Quick distillation: 10 batches, big model as teacher
+        explorer_model.train()
+        for _ in range(10):
+            idx = torch.randint(0, n, (2048,), device=DEVICE)
+            states = agent._gpu_states[idx]
+            with torch.no_grad():
+                teacher_values = agent.model(states)
+            student_values = explorer_model(states)
+            loss = torch.nn.functional.mse_loss(student_values, teacher_values)
+            explorer_optimizer.zero_grad()
+            loss.backward()
+            explorer_optimizer.step()
+        explorer_model.eval()
+
+    # Get small model weights for workers
+    explorer_weights = {k: v.cpu().numpy() for k, v in explorer_model.state_dict().items()}
+    pool = WorkerPool(NUM_WORKERS, explorer_weights,
                       state_size=env.get_state_size(),
-                      n_neurons=n_neurons, activations=activations,
+                      n_neurons=worker_neurons, activations=worker_activations,
                       n_step=n_step, discount=discount)
 
     # ── Live Dashboard ───────────────────────────────��──────────────
@@ -621,12 +650,15 @@ def dqn(resume_from=None, fast_mode=False):
             agent.add_batch_to_memory(all_experiences)
             agent.flush_to_gpu()
 
-            # Sync weights periodically so workers use updated model
+            # Periodically distill big model → small explorer, then sync to workers
             _collections_since_sync[0] += 1
             sync = False
             if _collections_since_sync[0] >= _weight_sync_interval:
                 with weights_lock:
-                    pool.update_weights(agent.get_weights())
+                    _sync_explorer()
+                    explorer_weights = {k: v.cpu().numpy()
+                                        for k, v in explorer_model.state_dict().items()}
+                    pool.update_weights(explorer_weights)
                 _collections_since_sync[0] = 0
                 sync = True
 
