@@ -1,7 +1,7 @@
 '''
-Parallel Tetris workers with shared memory weights + multi-episode batches.
-Workers stay alive, reuse envs, and pull weights from shared memory
-instead of deserializing from Queue each time.
+Parallel Tetris workers with GPU-batched inference.
+Workers run Numba-JIT game logic and send candidate states to GPU
+for evaluation instead of running their own CPU models.
 '''
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -11,87 +11,23 @@ os.environ['ABSL_MIN_LOG_LEVEL'] = '3'
 import numpy as np
 import random
 import time as _time
-import torch
-import torch.nn as nn
 from tetris import Tetris
 from multiprocessing import Process, Queue
-from multiprocessing.shared_memory import SharedMemory
-import struct
-
-# Per-step sleep to spread CPU load evenly (prevents spikes)
-# Set to 0 to disable throttling (fast mode)
-STEP_THROTTLE = 0.001  # 1ms pause between game steps — overridden by WorkerPool
 
 
-def _build_model(weights_dict):
-    '''Build model from weight dict (CPU only)'''
-    keys = sorted([k for k in weights_dict if 'weight' in k])
-    layers = []
-    for i, k in enumerate(keys):
-        w = weights_dict[k]
-        in_f, out_f = w.shape[1], w.shape[0]
-        layers.append(nn.Linear(in_f, out_f))
-        if i < len(keys) - 1:
-            layers.append(nn.ReLU())
-    model = nn.Sequential(*layers)
-    _load_weights(model, weights_dict)
-    model.eval()
-    return model
-
-
-def _load_weights(model, weights_dict):
-    '''Load weights into existing model, stripping net. prefix'''
-    state_dict = {}
-    for k, v in weights_dict.items():
-        state_dict[k.replace('net.', '')] = torch.tensor(v)
-    model.load_state_dict(state_dict)
-
-
-def _load_weights_from_shm(model, shm_name, param_layout, version_box):
-    '''Load weights from shared memory block. Skips if version unchanged.'''
-    shm = SharedMemory(name=shm_name, create=False)
-    # First 8 bytes = uint64 version counter
-    new_version = struct.unpack('Q', shm.buf[:8])[0]
-    if new_version == version_box[0]:
-        shm.close()
-        return  # Weights haven't changed
-    version_box[0] = new_version
-
-    state_dict = {}
-    for clean_key, offset, shape, nbytes in param_layout:
-        arr = np.ndarray(shape, dtype=np.float32, buffer=shm.buf, offset=offset).copy()
-        state_dict[clean_key] = torch.from_numpy(arr)
-    model.load_state_dict(state_dict)
-    shm.close()
-
-
-def _worker_loop(task_queue, result_queue, shm_name, param_layout, step_throttle=0.001):
-    '''Persistent worker with shared memory weight loading + multi-episode.
-    Returns results one episode at a time for rolling collection.'''
-    model = None
+def _worker_loop(task_queue, result_queue, inference_queue, response_queues, worker_id,
+                 step_throttle=0.0):
+    '''Persistent worker — plays Tetris games, sends states to GPU for evaluation.
+    No local model. All inference happens on GPU via queues.'''
     env = Tetris()
-    version_box = [-1]
+    my_response_queue = response_queues[worker_id]
 
     while True:
         task = task_queue.get()
         if task is None:
             break
 
-        init_weights, epsilon, episodes_per_worker = task
-
-        if model is None:
-            if init_weights is None:
-                # First task came without weights — build from SharedMemory
-                # Read shapes from param_layout to construct the model
-                fake_weights = {}
-                for clean_key, offset, shape, nbytes in param_layout:
-                    fake_weights[clean_key] = np.zeros(shape, dtype=np.float32)
-                model = _build_model(fake_weights)
-            else:
-                model = _build_model(init_weights)
-            version_box[0] = -1
-
-        _load_weights_from_shm(model, shm_name, param_layout, version_box)
+        epsilon, episodes_per_worker = task
 
         all_experiences = []
         all_scores = []
@@ -104,29 +40,37 @@ def _worker_loop(task_queue, result_queue, shm_name, param_layout, step_throttle
             experiences = []
 
             while not done:
-                next_states = {tuple(v): k for k, v in env.get_next_states().items()}
+                next_states_dict = env.get_next_states()
 
-                if not next_states:
+                if not next_states_dict:
                     break
 
-                if random.random() <= epsilon:
-                    best_state = random.choice(list(next_states.keys()))
-                else:
-                    states_list = list(next_states.keys())
-                    with torch.no_grad():
-                        states_t = torch.tensor(states_list, dtype=torch.float32)
-                        values = model(states_t)
-                        best_idx = torch.argmax(values).item()
-                    best_state = states_list[best_idx]
+                # Flip: {action: state_vec} → {state_tuple: action}
+                state_to_action = {}
+                states_list = []
+                for action, state_vec in next_states_dict.items():
+                    state_tuple = tuple(state_vec)
+                    state_to_action[state_tuple] = action
+                    states_list.append(state_vec)
 
-                best_action = next_states[best_state]
+                if random.random() <= epsilon:
+                    # Random exploration — no GPU needed
+                    best_state = random.choice(list(state_to_action.keys()))
+                else:
+                    # Send to GPU for batch evaluation
+                    states_array = np.array(states_list, dtype=np.float32)
+                    inference_queue.put((worker_id, states_array))
+                    # Block until GPU returns the best index
+                    best_idx = my_response_queue.get()
+                    best_state = tuple(states_list[best_idx])
+
+                best_action = state_to_action[best_state]
                 reward, done = env.play(best_action[0], best_action[1])
 
                 experiences.append((current_state, best_state, reward, done))
                 current_state = best_state
                 steps += 1
 
-                # Throttle CPU — small sleep spreads load evenly
                 if step_throttle > 0:
                     _time.sleep(step_throttle)
 
@@ -138,66 +82,32 @@ def _worker_loop(task_queue, result_queue, shm_name, param_layout, step_throttle
 
 
 class WorkerPool:
-    '''Pool of persistent workers with shared memory weight transport.'''
+    '''Pool of persistent workers with GPU-batched inference.
+    Workers send candidate states to GPU via inference_queue.
+    GPU inference thread (in run.py) evaluates and returns results.'''
 
-    def __init__(self, num_workers, init_weights, step_throttle=0.001):
+    def __init__(self, num_workers, step_throttle=0.0):
         self.num_workers = num_workers
         self.task_queue = Queue()
         self.result_queue = Queue()
+
+        # GPU inference queues
+        self.inference_queue = Queue()  # Workers → GPU: (worker_id, states_array)
+        self.response_queues = [Queue() for _ in range(num_workers)]  # GPU → Workers: best_idx
+
         self.workers = []
-
-        # Set up shared memory for weights
-        self._param_layout = []  # [(clean_key, offset, shape, nbytes), ...]
-        offset = 8  # First 8 bytes reserved for version counter
-        for k, v in init_weights.items():
-            clean_key = k.replace('net.', '')
-            arr = np.asarray(v, dtype=np.float32)
-            nbytes = arr.nbytes
-            self._param_layout.append((clean_key, offset, arr.shape, nbytes))
-            offset += nbytes
-
-        self._shm_size = offset
-        self._shm = SharedMemory(create=True, size=self._shm_size)
-        self._shm_name = self._shm.name
-        self._version = 0
-
-        # Write initial weights
-        self._write_weights(init_weights)
-
-        # Start workers
-        for _ in range(num_workers):
+        for i in range(num_workers):
             p = Process(target=_worker_loop,
                         args=(self.task_queue, self.result_queue,
-                              self._shm_name, self._param_layout, step_throttle),
+                              self.inference_queue, self.response_queues, i,
+                              step_throttle),
                         daemon=True)
             p.start()
             self.workers.append(p)
 
-    def _write_weights(self, weights):
-        '''Write weights to shared memory + bump version.'''
-        self._version += 1
-        struct.pack_into('Q', self._shm.buf, 0, self._version)
-        for clean_key, offset, shape, nbytes in self._param_layout:
-            orig_key = 'net.' + clean_key
-            arr = np.asarray(weights[orig_key], dtype=np.float32)
-            self._shm.buf[offset:offset + nbytes] = arr.tobytes()
-
-    def update_weights(self, weights):
-        '''Update shared memory with new weights (called from main process).'''
-        self._write_weights(weights)
-
-    def dispatch(self, init_weights, epsilon, episodes_per_worker):
-        '''Dispatch work to all workers. Non-blocking — call collect() to get results.'''
-        for _ in range(self.num_workers):
-            # Only send weights on first call (workers use SharedMemory after that)
-            self.task_queue.put((init_weights, epsilon, episodes_per_worker))
-        self._pending = self.num_workers
-
-    def dispatch_one(self, init_weights, epsilon, episodes_per_worker):
-        '''Dispatch a single task (for rolling re-dispatch).
-        Sends None for weights to avoid serializing large dicts through Queue —
-        workers read weights from SharedMemory instead.'''
-        self.task_queue.put((None, epsilon, episodes_per_worker))
+    def dispatch_one(self, epsilon, episodes_per_worker):
+        '''Dispatch a single task to one worker.'''
+        self.task_queue.put((epsilon, episodes_per_worker))
         self._pending = getattr(self, '_pending', 0) + 1
 
     def collect_one(self):
@@ -206,23 +116,8 @@ class WorkerPool:
         self._pending = max(0, getattr(self, '_pending', 1) - 1)
         return result
 
-    def collect(self):
-        '''Collect results from all workers. Blocking.'''
-        results = []
-        for _ in range(getattr(self, '_pending', self.num_workers)):
-            results.append(self.result_queue.get())
-        self._pending = 0
-        return results
-
-    def run_episodes(self, init_weights, epsilon, episodes_per_worker):
-        '''Dispatch + collect in one call.'''
-        self.dispatch(init_weights, epsilon, episodes_per_worker)
-        return self.collect()
-
     def shutdown(self):
         for _ in self.workers:
             self.task_queue.put(None)
         for p in self.workers:
             p.join(timeout=5)
-        self._shm.close()
-        self._shm.unlink()

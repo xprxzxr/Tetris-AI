@@ -3,569 +3,589 @@ import cv2
 import numpy as np
 from PIL import Image
 from time import sleep
+from numba import njit
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  Pre-baked numpy data structures for Numba JIT
+# ═══════════════════════════════════════════════════════════════════
+
+# TETROMINOS: shape (7, 4, 4, 2) — [piece_id][rot_idx][block][x,y]
+# rot_idx: 0=0°, 1=90°, 2=180°, 3=270°
+_TETROMINOS_NP = np.zeros((7, 4, 4, 2), dtype=np.int32)
+
+_TETROMINOS_DICT = {
+    0: {0: [(0,0),(1,0),(2,0),(3,0)], 1: [(1,0),(1,1),(1,2),(1,3)],
+        2: [(3,0),(2,0),(1,0),(0,0)], 3: [(1,3),(1,2),(1,1),(1,0)]},
+    1: {0: [(1,0),(0,1),(1,1),(2,1)], 1: [(0,1),(1,2),(1,1),(1,0)],
+        2: [(1,2),(2,1),(1,1),(0,1)], 3: [(2,1),(1,0),(1,1),(1,2)]},
+    2: {0: [(1,0),(1,1),(1,2),(2,2)], 1: [(0,1),(1,1),(2,1),(2,0)],
+        2: [(1,2),(1,1),(1,0),(0,0)], 3: [(2,1),(1,1),(0,1),(0,2)]},
+    3: {0: [(1,0),(1,1),(1,2),(0,2)], 1: [(0,1),(1,1),(2,1),(2,2)],
+        2: [(1,2),(1,1),(1,0),(2,0)], 3: [(2,1),(1,1),(0,1),(0,0)]},
+    4: {0: [(0,0),(1,0),(1,1),(2,1)], 1: [(0,2),(0,1),(1,1),(1,0)],
+        2: [(2,1),(1,1),(1,0),(0,0)], 3: [(1,0),(1,1),(0,1),(0,2)]},
+    5: {0: [(2,0),(1,0),(1,1),(0,1)], 1: [(0,0),(0,1),(1,1),(1,2)],
+        2: [(0,1),(1,1),(1,0),(2,0)], 3: [(1,2),(1,1),(0,1),(0,0)]},
+    6: {0: [(1,0),(2,0),(1,1),(2,1)], 1: [(1,0),(2,0),(1,1),(2,1)],
+        2: [(1,0),(2,0),(1,1),(2,1)], 3: [(1,0),(2,0),(1,1),(2,1)]},
+}
+
+for pid in range(7):
+    for ri in range(4):
+        blocks = _TETROMINOS_DICT[pid][ri]
+        for bi, (bx, by) in enumerate(blocks):
+            _TETROMINOS_NP[pid, ri, bi, 0] = bx
+            _TETROMINOS_NP[pid, ri, bi, 1] = by
+
+# NES Gravity: shape (30,) — frames_per_drop for levels 0-29
+_NES_GRAVITY_NP = np.array([
+    48, 43, 38, 33, 28, 23, 18, 13, 8, 6,  # 0-9
+    5, 5, 5, 4, 4, 4, 3, 3, 3,             # 10-18
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2,          # 19-28
+    1,                                       # 29 (kill screen)
+], dtype=np.int32)
+
+# NES Score table: index by lines cleared (0-4)
+_NES_SCORE_NP = np.array([0, 40, 100, 300, 1200], dtype=np.int32)
+
+# Constants
+_W = np.int32(10)
+_H = np.int32(20)
+_SPAWN_X = np.int32(3)
+_DAS_INITIAL = np.int32(16)
+_DAS_REPEAT = np.int32(6)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Numba JIT functions — all hot paths compiled to native code
+# ═══════════════════════════════════════════════════════════════════
+
+@njit(cache=True)
+def _check_collision(piece, pos_x, pos_y, board):
+    '''Check if piece collides with board or boundaries.'''
+    for i in range(4):
+        x = piece[i, 0] + pos_x
+        y = piece[i, 1] + pos_y
+        if x < 0 or x >= _W or y < 0 or y >= _H or board[y, x] != 0:
+            return True
+    return False
+
+
+@njit(cache=True)
+def _fast_drop_y(piece, pos_x, col_tops):
+    '''Compute drop y-position directly using column tops.'''
+    max_y = _H
+    for i in range(4):
+        px = piece[i, 0]
+        py = piece[i, 1]
+        col = px + pos_x
+        col_top = col_tops[col]
+        val = col_top - py
+        if val < max_y:
+            max_y = val
+    return max_y - 1
+
+
+@njit(cache=True)
+def _clear_lines(board):
+    '''Clear completed lines. Returns (lines_cleared, new_board).'''
+    num_clears = 0
+    cleared = np.zeros(_H, dtype=np.int32)
+
+    for row in range(_H):
+        is_full = True
+        for col in range(_W):
+            if board[row, col] == 0:
+                is_full = False
+                break
+        if is_full:
+            cleared[num_clears] = row
+            num_clears += 1
+
+    if num_clears == 0:
+        return 0, board.copy()
+
+    new_board = np.zeros((_H, _W), dtype=np.int32)
+    write_idx = _H - 1
+    for read_idx in range(_H - 1, -1, -1):
+        is_cleared = False
+        for i in range(num_clears):
+            if read_idx == cleared[i]:
+                is_cleared = True
+                break
+        if not is_cleared:
+            for col in range(_W):
+                new_board[write_idx, col] = board[read_idx, col]
+            write_idx -= 1
+    return num_clears, new_board
+
+
+@njit(cache=True)
+def _recompute_col_tops(board):
+    '''Recompute column top positions from board.'''
+    col_tops = np.full(_W, _H, dtype=np.int32)
+    for col in range(_W):
+        for row in range(_H):
+            if board[row, col] != 0:
+                col_tops[col] = row
+                break
+    return col_tops
+
+
+@njit(cache=True)
+def _add_piece_to_board(piece, pos_x, pos_y, board, cell_value):
+    '''Place piece on a copy of board. Returns new board.'''
+    new_board = board.copy()
+    for i in range(4):
+        x = piece[i, 0] + pos_x
+        y = piece[i, 1] + pos_y
+        new_board[y, x] = cell_value
+    return new_board
+
+
+@njit(cache=True)
+def _can_rotate_to(piece_id, pos_x, target_rot_idx, tetrominos, board):
+    '''Check rotation path from 0 to target. NES has NO wall kicks.'''
+    if target_rot_idx == 0:
+        return True
+
+    # Shortest path: CW or CCW
+    cw_steps = target_rot_idx
+    ccw_steps = (4 - target_rot_idx) % 4
+
+    if cw_steps <= ccw_steps:
+        for step in range(1, cw_steps + 1):
+            piece = tetrominos[piece_id, step]
+            if _check_collision(piece, pos_x, 0, board):
+                return False
+    else:
+        for step in range(1, ccw_steps + 1):
+            ri = (4 - step) % 4
+            piece = tetrominos[piece_id, ri]
+            if _check_collision(piece, pos_x, 0, board):
+                return False
+    return True
+
+
+@njit(cache=True)
+def _path_clear(piece, from_x, to_x, fpd, board):
+    '''Check piece can slide horizontally without collision during gravity.'''
+    if from_x == to_x:
+        return True
+
+    direction = np.int32(1) if to_x > from_x else np.int32(-1)
+    moves = abs(to_x - from_x)
+    current_x = from_x
+
+    for step in range(moves):
+        if step == 0:
+            frames_elapsed = _DAS_INITIAL
+        else:
+            frames_elapsed = _DAS_INITIAL + step * _DAS_REPEAT
+
+        rows_dropped = frames_elapsed // fpd
+        if rows_dropped > _H - 1:
+            rows_dropped = _H - 1
+        current_x += direction
+
+        if _check_collision(piece, current_x, rows_dropped, board):
+            return False
+    return True
+
+
+@njit(cache=True)
+def _compute_reachable(piece_id, tetrominos, board, col_tops, fpd):
+    '''Return reachable placements as (N, 2) array of [x, rot_idx].'''
+    # Max possible: 10 positions × 4 rotations = 40
+    result = np.zeros((40, 2), dtype=np.int32)
+    count = np.int32(0)
+
+    # Determine valid rotations for this piece
+    if piece_id == 6:
+        num_rots = 1
+    elif piece_id == 0:
+        num_rots = 2
+    else:
+        num_rots = 4
+
+    for rot_idx in range(num_rots):
+        piece = tetrominos[piece_id, rot_idx]
+
+        # Find min/max x of piece blocks
+        min_px = piece[0, 0]
+        max_px = piece[0, 0]
+        for i in range(1, 4):
+            if piece[i, 0] < min_px:
+                min_px = piece[i, 0]
+            if piece[i, 0] > max_px:
+                max_px = piece[i, 0]
+
+        # Check rotation validity at spawn
+        if not _can_rotate_to(piece_id, _SPAWN_X, rot_idx, tetrominos, board):
+            continue
+
+        # Rotation cost frames
+        cw_steps = rot_idx
+        ccw_steps = (4 - rot_idx) % 4
+        rot_steps = min(cw_steps, ccw_steps)
+        rot_frames = rot_steps
+
+        # Drop distance at spawn
+        drop_y = _fast_drop_y(piece, _SPAWN_X, col_tops)
+        if drop_y < 0:
+            continue
+
+        total_fall_rows = drop_y if drop_y > 0 else 1
+        total_frames = total_fall_rows * fpd
+        move_frames = total_frames - rot_frames
+        if move_frames < 0:
+            move_frames = 0
+
+        # DAS calculation
+        if move_frames < _DAS_INITIAL:
+            max_moves = np.int32(0)
+        else:
+            max_moves = np.int32(1 + (move_frames - _DAS_INITIAL) // _DAS_REPEAT)
+
+        # Check each valid x
+        for x in range(-min_px, _W - max_px):
+            moves_needed = abs(x - _SPAWN_X)
+            if moves_needed <= max_moves:
+                if _path_clear(piece, _SPAWN_X, x, fpd, board):
+                    result[count, 0] = x
+                    result[count, 1] = rot_idx
+                    count += 1
+
+    return result[:count]
+
+
+@njit(cache=True)
+def _count_holes(board):
+    '''Count total holes in board.'''
+    holes = np.int32(0)
+    for col in range(_W):
+        found_block = False
+        for row in range(_H):
+            if board[row, col] != 0:
+                found_block = True
+            elif found_block:
+                holes += 1
+    return holes
+
+
+@njit(cache=True)
+def _get_board_props(board, lines_cleared, level, current_piece, next_piece, fpd):
+    '''Compute 242-float state vector from board. All numpy, all fast.'''
+    result = np.zeros(242, dtype=np.float64)
+
+    # [0..199] Board binary
+    for row in range(_H):
+        for col in range(_W):
+            if board[row, col] != 0:
+                result[row * _W + col] = 1.0
+
+    # Per-column analysis
+    col_heights = np.zeros(_W, dtype=np.int32)
+    col_holes = np.zeros(_W, dtype=np.int32)
+    sum_height = np.int32(0)
+    total_holes = np.int32(0)
+
+    for col in range(_W):
+        top = _H
+        for row in range(_H):
+            if board[row, col] != 0:
+                top = row
+                break
+        height = _H - top
+        col_heights[col] = height
+        sum_height += height
+
+        for row in range(top + 1, _H):
+            if board[row, col] == 0:
+                col_holes[col] += 1
+                total_holes += 1
+
+    # Bumpiness
+    total_bumpiness = np.int32(0)
+    for col in range(_W - 1):
+        d = col_heights[col] - col_heights[col + 1]
+        if d < 0:
+            d = -d
+        total_bumpiness += d
+
+    max_height = np.int32(0)
+    for col in range(_W):
+        if col_heights[col] > max_height:
+            max_height = col_heights[col]
+
+    # Well depths
+    col_wells = np.zeros(_W, dtype=np.int32)
+    for col in range(_W):
+        left_h = col_heights[col - 1] if col > 0 else _H
+        right_h = col_heights[col + 1] if col < _W - 1 else _H
+        min_n = left_h if left_h < right_h else right_h
+        depth = min_n - col_heights[col]
+        if depth < 0:
+            depth = 0
+        col_wells[col] = depth
+
+    # Tetris readiness
+    tetris_ready = 0.0
+    for col in range(_W):
+        if col_wells[col] >= 4 and col_holes[col] == 0:
+            other_bump = np.int32(0)
+            prev_h = np.int32(-1)
+            for c in range(_W):
+                if c != col:
+                    if prev_h >= 0:
+                        d = col_heights[c] - prev_h
+                        if d < 0:
+                            d = -d
+                        other_bump += d
+                    prev_h = col_heights[c]
+            if other_bump <= 6:
+                tetris_ready = 1.0
+                break
+
+    # Row transitions
+    row_trans = np.int32(0)
+    for row in range(_H):
+        for col in range(_W - 1):
+            a = np.int32(1) if board[row, col] != 0 else np.int32(0)
+            b = np.int32(1) if board[row, col + 1] != 0 else np.int32(0)
+            if a != b:
+                row_trans += 1
+        if board[row, 0] == 0:
+            row_trans += 1
+        if board[row, _W - 1] == 0:
+            row_trans += 1
+
+    # Column transitions
+    col_trans = np.int32(0)
+    for col in range(_W):
+        for row in range(_H - 1):
+            a = np.int32(1) if board[row, col] != 0 else np.int32(0)
+            b = np.int32(1) if board[row + 1, col] != 0 else np.int32(0)
+            if a != b:
+                col_trans += 1
+        if board[_H - 1, col] == 0:
+            col_trans += 1
+
+    # Assemble features [200..241]
+    H_f = np.float64(_H)
+    W_f = np.float64(_W)
+
+    for col in range(_W):
+        result[200 + col] = col_heights[col] / H_f
+    for col in range(_W):
+        result[210 + col] = col_holes[col] / H_f
+    for col in range(_W):
+        result[220 + col] = col_wells[col] / H_f
+
+    result[230] = np.float64(lines_cleared)
+    result[231] = np.float64(total_holes) / (W_f * H_f)
+    result[232] = np.float64(total_bumpiness) / H_f
+    result[233] = np.float64(sum_height) / (W_f * H_f)
+    result[234] = np.float64(max_height) / H_f
+    result[235] = tetris_ready
+    result[236] = np.float64(row_trans) / (H_f * (W_f + 1.0))
+    result[237] = np.float64(col_trans) / (W_f * H_f)
+
+    result[238] = np.float64(level) / 29.0
+    result[239] = np.float64(fpd) / 48.0
+    result[240] = np.float64(current_piece) / 6.0
+    result[241] = np.float64(next_piece) / 6.0
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Tetris class — same public API, JIT internals
+# ═══════════════════════════════════════════════════════════════════
 
 class Tetris:
+    '''NES Tetris (1989) — Numba JIT accelerated.
+    Same public API as before. All hot paths run as native compiled code.'''
 
-    '''NES Tetris (1989) — authentic rules, scoring, colors, and speed system.
-    Uses reachability-filtered placement: the AI picks target positions,
-    but unreachable placements (due to NES drop speed) are filtered out.'''
-
-    MAP_EMPTY = 0
-    # Placed blocks store piece_id + 1 (values 1-7) for colored rendering
-    MAP_PLAYER = 8  # Active piece highlight for rendering
     BOARD_WIDTH = 10
     BOARD_HEIGHT = 20
+    MAP_EMPTY = 0
+    MAP_PLAYER = 8
 
+    # Keep dict versions for render() only
     TETROMINOS = {
-        0: { # I
-            0: [(0,0), (1,0), (2,0), (3,0)],
-            90: [(1,0), (1,1), (1,2), (1,3)],
-            180: [(3,0), (2,0), (1,0), (0,0)],
-            270: [(1,3), (1,2), (1,1), (1,0)],
-        },
-        1: { # T
-            0: [(1,0), (0,1), (1,1), (2,1)],
-            90: [(0,1), (1,2), (1,1), (1,0)],
-            180: [(1,2), (2,1), (1,1), (0,1)],
-            270: [(2,1), (1,0), (1,1), (1,2)],
-        },
-        2: { # L
-            0: [(1,0), (1,1), (1,2), (2,2)],
-            90: [(0,1), (1,1), (2,1), (2,0)],
-            180: [(1,2), (1,1), (1,0), (0,0)],
-            270: [(2,1), (1,1), (0,1), (0,2)],
-        },
-        3: { # J
-            0: [(1,0), (1,1), (1,2), (0,2)],
-            90: [(0,1), (1,1), (2,1), (2,2)],
-            180: [(1,2), (1,1), (1,0), (2,0)],
-            270: [(2,1), (1,1), (0,1), (0,0)],
-        },
-        4: { # Z
-            0: [(0,0), (1,0), (1,1), (2,1)],
-            90: [(0,2), (0,1), (1,1), (1,0)],
-            180: [(2,1), (1,1), (1,0), (0,0)],
-            270: [(1,0), (1,1), (0,1), (0,2)],
-        },
-        5: { # S
-            0: [(2,0), (1,0), (1,1), (0,1)],
-            90: [(0,0), (0,1), (1,1), (1,2)],
-            180: [(0,1), (1,1), (1,0), (2,0)],
-            270: [(1,2), (1,1), (0,1), (0,0)],
-        },
-        6: { # O
-            0: [(1,0), (2,0), (1,1), (2,1)],
-            90: [(1,0), (2,0), (1,1), (2,1)],
-            180: [(1,0), (2,0), (1,1), (2,1)],
-            270: [(1,0), (2,0), (1,1), (2,1)],
-        }
+        0: {0: [(0,0),(1,0),(2,0),(3,0)], 90: [(1,0),(1,1),(1,2),(1,3)],
+            180: [(3,0),(2,0),(1,0),(0,0)], 270: [(1,3),(1,2),(1,1),(1,0)]},
+        1: {0: [(1,0),(0,1),(1,1),(2,1)], 90: [(0,1),(1,2),(1,1),(1,0)],
+            180: [(1,2),(2,1),(1,1),(0,1)], 270: [(2,1),(1,0),(1,1),(1,2)]},
+        2: {0: [(1,0),(1,1),(1,2),(2,2)], 90: [(0,1),(1,1),(2,1),(2,0)],
+            180: [(1,2),(1,1),(1,0),(0,0)], 270: [(2,1),(1,1),(0,1),(0,2)]},
+        3: {0: [(1,0),(1,1),(1,2),(0,2)], 90: [(0,1),(1,1),(2,1),(2,2)],
+            180: [(1,2),(1,1),(1,0),(2,0)], 270: [(2,1),(1,1),(0,1),(0,0)]},
+        4: {0: [(0,0),(1,0),(1,1),(2,1)], 90: [(0,2),(0,1),(1,1),(1,0)],
+            180: [(2,1),(1,1),(1,0),(0,0)], 270: [(1,0),(1,1),(0,1),(0,2)]},
+        5: {0: [(2,0),(1,0),(1,1),(0,1)], 90: [(0,0),(0,1),(1,1),(1,2)],
+            180: [(0,1),(1,1),(1,0),(2,0)], 270: [(1,2),(1,1),(0,1),(0,0)]},
+        6: {0: [(1,0),(2,0),(1,1),(2,1)], 90: [(1,0),(2,0),(1,1),(2,1)],
+            180: [(1,0),(2,0),(1,1),(2,1)], 270: [(1,0),(2,0),(1,1),(2,1)]},
     }
 
-    # ── NES Colors (RGB) ───────────────────────────────────────
     COLORS = {
-        0: (0, 0, 0),          # Empty = black
-        1: (0, 240, 240),      # I = cyan
-        2: (160, 0, 240),      # T = purple
-        3: (240, 160, 0),      # L = orange
-        4: (0, 0, 240),        # J = blue
-        5: (240, 0, 0),        # Z = red
-        6: (0, 240, 0),        # S = green
-        7: (240, 240, 0),      # O = yellow
-        8: (255, 255, 255),    # Active piece = white highlight
+        0: (0, 0, 0), 1: (0, 240, 240), 2: (160, 0, 240),
+        3: (240, 160, 0), 4: (0, 0, 240), 5: (240, 0, 0),
+        6: (0, 240, 0), 7: (240, 240, 0), 8: (255, 255, 255),
     }
 
-    # ── NES Scoring ────────────────────────────────────────────
-    # Points = base * (level + 1)
     NES_SCORE_TABLE = {0: 0, 1: 40, 2: 100, 3: 300, 4: 1200}
-
-    # ── NES Gravity (NTSC frames per drop) ─────────────────────
-    NES_GRAVITY = {
-        0: 48, 1: 43, 2: 38, 3: 33, 4: 28, 5: 23, 6: 18,
-        7: 13, 8: 8, 9: 6, 10: 5, 11: 5, 12: 5, 13: 4,
-        14: 4, 15: 4, 16: 3, 17: 3, 18: 3,
-    }
-    # Levels 19-28: 2 frames, Level 29+: 1 frame (kill screen)
-
-    # ── NES DAS (Delayed Auto Shift) ───────────────────────────
-    DAS_INITIAL = 16   # Frames before first horizontal repeat
-    DAS_REPEAT = 6     # Frames between subsequent repeats
-
-    SPAWN_X = 3        # NES spawn column
 
     def __init__(self):
         self.reset()
 
     def reset(self):
         '''Resets the game, returning the current state'''
-        self.board = [[0] * Tetris.BOARD_WIDTH for _ in range(Tetris.BOARD_HEIGHT)]
+        self.board = np.zeros((_H, _W), dtype=np.int32)
         self.game_over = False
         self.score = 0
         self.level = 0
         self.total_lines = 0
-        self._last_piece = -1  # For NES random
+        self._last_piece = -1
 
-        # NES random: first two pieces
         self.next_piece = self._nes_random_piece()
-        # Pre-compute column top positions
-        self._col_tops = [Tetris.BOARD_HEIGHT] * Tetris.BOARD_WIDTH
+        self._col_tops = np.full(_W, _H, dtype=np.int32)
         self._new_round()
 
-        return self._get_board_props(self.board)
+        fpd = self._get_fpd()
+        lines_cleared, clean_board = _clear_lines(self.board)
+        return _get_board_props(clean_board, lines_cleared, self.level,
+                                self.current_piece, self.next_piece, fpd)
 
     def _nes_random_piece(self):
-        '''NES random piece selection: pick 0-7, if 7 or same as last, re-roll to 0-6.'''
         roll = random.randint(0, 7)
         if roll == 7 or roll == self._last_piece:
             roll = random.randint(0, 6)
         self._last_piece = roll
         return roll
 
-    def _get_frames_per_drop(self):
-        '''Get NES gravity speed for current level.'''
-        if self.level >= 29:
-            return 1  # Kill screen
-        if self.level >= 19:
-            return 2
-        return Tetris.NES_GRAVITY.get(self.level, 2)
-
-    def _get_rotated_piece(self):
-        '''Returns the current piece, including rotation'''
-        return Tetris.TETROMINOS[self.current_piece][self.current_rotation]
-
-    def _get_complete_board(self):
-        '''Returns the complete board with NES colors (piece IDs for placed, MAP_PLAYER for active)'''
-        piece = self._get_rotated_piece()
-        board = [x[:] for x in self.board]
-        for x, y in piece:
-            board[y + self.current_pos[1]][x + self.current_pos[0]] = Tetris.MAP_PLAYER
-        return board
-
-    def get_game_score(self):
-        '''Returns the current game score.'''
-        return self.score
+    def _get_fpd(self):
+        '''Get NES gravity (frames per drop) for current level.'''
+        level = min(self.level, 29)
+        return int(_NES_GRAVITY_NP[level])
 
     def _new_round(self):
-        '''Starts a new round (new piece) — NES random selection'''
         self.current_piece = self.next_piece
         self.next_piece = self._nes_random_piece()
-        self.current_pos = [Tetris.SPAWN_X, 0]
+        self.current_pos = [3, 0]
         self.current_rotation = 0
 
-        if self._check_collision(self._get_rotated_piece(), self.current_pos):
+        piece = _TETROMINOS_NP[self.current_piece, 0]
+        if _check_collision(piece, np.int32(3), np.int32(0), self.board):
             self.game_over = True
 
-    def _check_collision(self, piece, pos):
-        '''Check if there is a collision between the current piece and the board'''
-        for x, y in piece:
-            x += pos[0]
-            y += pos[1]
-            if x < 0 or x >= Tetris.BOARD_WIDTH \
-                    or y < 0 or y >= Tetris.BOARD_HEIGHT \
-                    or self.board[y][x] != Tetris.MAP_EMPTY:
-                return True
-        return False
-
-    def _add_piece_to_board(self, piece, pos):
-        '''Place a piece in the board with NES color (stores piece_id + 1)'''
-        board = [x[:] for x in self.board]
-        cell_value = self.current_piece + 1  # 1-7 for colored rendering
-        for x, y in piece:
-            board[y + pos[1]][x + pos[0]] = cell_value
-        return board
-
-    def _clear_lines(self, board):
-        '''Clears completed lines in a board (NES-style: any non-zero cell counts)'''
-        lines_to_clear = [i for i, row in enumerate(board) if all(cell != 0 for cell in row)]
-        if lines_to_clear:
-            board = [row for i, row in enumerate(board) if i not in lines_to_clear]
-            for _ in lines_to_clear:
-                board.insert(0, [0 for _ in range(Tetris.BOARD_WIDTH)])
-        return len(lines_to_clear), board
-
-    def _recompute_col_tops(self, board):
-        '''Recompute column top positions from a board'''
-        col_tops = [Tetris.BOARD_HEIGHT] * Tetris.BOARD_WIDTH
-        for col in range(Tetris.BOARD_WIDTH):
-            for row in range(Tetris.BOARD_HEIGHT):
-                if board[row][col] != Tetris.MAP_EMPTY:
-                    col_tops[col] = row
-                    break
-        return col_tops
-
-    def _get_board_props(self, board):
-        '''Get board state — rich features for human-like play.
-
-        Layout (242 floats):
-          [0..199]   200  Board binary (1.0 = filled, 0.0 = empty)
-          [200..209]  10  Per-column heights (normalized /20)
-          [210..219]  10  Per-column hole counts (normalized /20)
-          [220..229]  10  Per-column well depth (how much deeper than neighbors, /20)
-          [230]        1  Lines cleared this move
-          [231]        1  Total holes
-          [232]        1  Total bumpiness
-          [233]        1  Sum of heights
-          [234]        1  Max column height (/20)
-          [235]        1  Tetris-readiness (1.0 if a clean well exists for I-piece)
-          [236]        1  Row transitions (empty↔filled changes across rows, normalized)
-          [237]        1  Column transitions (empty↔filled changes down columns, normalized)
-          [238]        1  Level (/29)
-          [239]        1  Speed — frames per drop (/48)
-          [240]        1  Current piece (/6)
-          [241]        1  Next piece (/6)
-        '''
-        lines, board = self._clear_lines(board)
-
-        # ── Flatten board to 200 binary floats ─────────────────────
-        flat = []
-        for row in board:
-            for cell in row:
-                flat.append(1.0 if cell != 0 else 0.0)
-
-        # ── Per-column analysis (single pass) ──────────────────────
-        W = Tetris.BOARD_WIDTH
-        H = Tetris.BOARD_HEIGHT
-        col_heights = [0] * W
-        col_holes = [0] * W
-        sum_height = 0
-        total_holes = 0
-        total_bumpiness = 0
-
-        for col in range(W):
-            top = H
-            for row in range(H):
-                if board[row][col] != Tetris.MAP_EMPTY:
-                    top = row
-                    break
-
-            height = H - top
-            col_heights[col] = height
-            sum_height += height
-
-            # Count holes below the top block in this column
-            h = 0
-            for row in range(top + 1, H):
-                if board[row][col] == Tetris.MAP_EMPTY:
-                    h += 1
-            col_holes[col] = h
-            total_holes += h
-
-        # Bumpiness
-        for col in range(W - 1):
-            total_bumpiness += abs(col_heights[col] - col_heights[col + 1])
-
-        max_height = max(col_heights)
-
-        # ── Well depth per column ──────────────────────────────────
-        # A "well" is a column significantly lower than both neighbors.
-        # The AI should learn to build and maintain one well for Tetrises.
-        col_wells = [0] * W
-        for col in range(W):
-            left_h = col_heights[col - 1] if col > 0 else H
-            right_h = col_heights[col + 1] if col < W - 1 else H
-            min_neighbor = min(left_h, right_h)
-            depth = max(0, min_neighbor - col_heights[col])
-            col_wells[col] = depth
-
-        # ── Tetris readiness ───────────────────────────────────────
-        # 1.0 if there's a clean well (depth ≥ 4, no holes in that column,
-        # and the rest of the board is relatively flat)
-        tetris_ready = 0.0
-        for col in range(W):
-            if col_wells[col] >= 4 and col_holes[col] == 0:
-                # Check the non-well columns are reasonably level
-                other_heights = [col_heights[c] for c in range(W) if c != col]
-                other_bump = sum(abs(other_heights[i] - other_heights[i+1])
-                                for i in range(len(other_heights) - 1))
-                if other_bump <= 6:  # Fairly flat
-                    tetris_ready = 1.0
-                    break
-
-        # ── Row transitions ────────────────────────────────────────
-        # Count horizontal transitions (empty↔filled) — messy boards have more
-        row_transitions = 0
-        for row in range(H):
-            for col in range(W - 1):
-                a = 1 if board[row][col] != Tetris.MAP_EMPTY else 0
-                b = 1 if board[row][col + 1] != Tetris.MAP_EMPTY else 0
-                if a != b:
-                    row_transitions += 1
-            # Border transitions (walls count as filled)
-            if board[row][0] == Tetris.MAP_EMPTY:
-                row_transitions += 1
-            if board[row][W - 1] == Tetris.MAP_EMPTY:
-                row_transitions += 1
-
-        # ── Column transitions ─────────────────────────────────────
-        # Count vertical transitions (empty↔filled) — overhangs cause these
-        col_transitions = 0
-        for col in range(W):
-            for row in range(H - 1):
-                a = 1 if board[row][col] != Tetris.MAP_EMPTY else 0
-                b = 1 if board[row + 1][col] != Tetris.MAP_EMPTY else 0
-                if a != b:
-                    col_transitions += 1
-            # Floor counts as filled
-            if board[H - 1][col] == Tetris.MAP_EMPTY:
-                col_transitions += 1
-
-        # ── Assemble feature vector ────────────────────────────────
-        # Per-column heights (10 values, normalized)
-        for col in range(W):
-            flat.append(col_heights[col] / H)
-
-        # Per-column holes (10 values, normalized)
-        for col in range(W):
-            flat.append(col_holes[col] / H)
-
-        # Per-column well depths (10 values, normalized)
-        for col in range(W):
-            flat.append(col_wells[col] / H)
-
-        # Aggregate features
-        flat.append(float(lines))                          # Lines cleared this move
-        flat.append(total_holes / (W * H))                 # Total holes (normalized)
-        flat.append(total_bumpiness / H)                   # Bumpiness (normalized)
-        flat.append(sum_height / (W * H))                  # Sum heights (normalized)
-        flat.append(max_height / H)                        # Max column height
-        flat.append(tetris_ready)                          # Tetris well ready?
-        flat.append(row_transitions / (H * (W + 1)))       # Row transitions (normalized)
-        flat.append(col_transitions / (W * H))             # Col transitions (normalized)
-
-        # NES-specific features
-        flat.append(self.level / 29.0)                     # Current level
-        flat.append(self._get_frames_per_drop() / 48.0)    # Current speed
-        flat.append(self.current_piece / 6.0)              # Current piece type
-        flat.append(self.next_piece / 6.0)                 # Next piece type
-
-        return flat
-
-    def _fast_drop_y(self, piece, pos_x):
-        '''Compute drop y-position directly using column tops.'''
-        max_y = Tetris.BOARD_HEIGHT
-        for px, py in piece:
-            col = px + pos_x
-            col_top = self._col_tops[col]
-            max_y = min(max_y, col_top - py)
-        return max_y - 1
-
-    # ── NES Reachability System ────────────────────────────────
-
-    def _can_rotate_to(self, piece_id, pos_x, target_rotation):
-        '''Check if piece can rotate from 0 to target_rotation at spawn.
-        NES has NO wall kicks — rotation fails on collision.'''
-        if target_rotation == 0:
-            return True
-
-        rotations_cw = [0, 90, 180, 270]
-        cw_steps = rotations_cw.index(target_rotation)
-        ccw_steps = (4 - cw_steps) % 4
-
-        # Try CW path (shorter path preferred)
-        best_steps = min(cw_steps, ccw_steps)
-        if best_steps == cw_steps:
-            path = rotations_cw[1:cw_steps + 1]
-        else:
-            path = [rotations_cw[(-i) % 4] for i in range(1, ccw_steps + 1)]
-
-        for rot in path:
-            piece = Tetris.TETROMINOS[piece_id][rot]
-            if self._check_collision(piece, [pos_x, 0]):
-                return False
-        return True
-
-    def _compute_reachable_placements(self):
-        '''Return set of (x, rotation) that are physically reachable at current NES speed.'''
-        fpd = self._get_frames_per_drop()
-        spawn_x = Tetris.SPAWN_X
-        piece_id = self.current_piece
-
-        reachable = set()
-
-        if piece_id == 6:
-            target_rotations = [0]
-        elif piece_id == 0:
-            target_rotations = [0, 90]
-        else:
-            target_rotations = [0, 90, 180, 270]
-
-        for target_rot in target_rotations:
-            piece = Tetris.TETROMINOS[piece_id][target_rot]
-            min_px = min(p[0] for p in piece)
-            max_px = max(p[0] for p in piece)
-
-            # Check rotation is valid at spawn (no wall kicks)
-            if not self._can_rotate_to(piece_id, spawn_x, target_rot):
-                continue
-
-            # Rotation cost (frames) — take shortest path CW or CCW
-            rotations_cw = [0, 90, 180, 270]
-            cw_steps = rotations_cw.index(target_rot)
-            rot_steps = min(cw_steps, (4 - cw_steps) % 4)
-            rot_frames = rot_steps  # 1 frame per rotation press
-
-            # How far piece falls from spawn position
-            drop_y = self._fast_drop_y(piece, spawn_x)
-            if drop_y < 0:
-                continue  # Can't even place at spawn
-
-            total_fall_rows = max(drop_y, 1)
-            total_frames = total_fall_rows * fpd
-
-            # Frames available for horizontal movement
-            move_frames = max(total_frames - rot_frames, 0)
-
-            # DAS: first move at DAS_INITIAL, then every DAS_REPEAT
-            if move_frames < Tetris.DAS_INITIAL:
-                max_moves = 0
-            else:
-                max_moves = 1 + (move_frames - Tetris.DAS_INITIAL) // Tetris.DAS_REPEAT
-
-            # Check each valid x position
-            for x in range(-min_px, Tetris.BOARD_WIDTH - max_px):
-                moves_needed = abs(x - spawn_x)
-                if moves_needed <= max_moves:
-                    # Verify path is clear (piece doesn't collide while sliding)
-                    if self._path_clear(piece_id, spawn_x, x, target_rot, fpd):
-                        reachable.add((x, target_rot))
-
-        return reachable
-
-    def _path_clear(self, piece_id, from_x, to_x, rotation, fpd):
-        '''Check the piece can slide horizontally without colliding as gravity pulls it down.'''
-        if from_x == to_x:
-            return True
-
-        piece = Tetris.TETROMINOS[piece_id][rotation]
-        direction = 1 if to_x > from_x else -1
-        moves = abs(to_x - from_x)
-
-        current_x = from_x
-        for step in range(moves):
-            if step == 0:
-                frames_elapsed = Tetris.DAS_INITIAL
-            else:
-                frames_elapsed = Tetris.DAS_INITIAL + step * Tetris.DAS_REPEAT
-
-            rows_dropped = min(frames_elapsed // fpd, Tetris.BOARD_HEIGHT - 1)
-            current_x += direction
-
-            if self._check_collision(piece, [current_x, rows_dropped]):
-                return False
-
-        return True
-
-    def get_next_states(self):
-        '''Get all reachable next states (filtered by NES physics).'''
-        reachable = self._compute_reachable_placements()
-        states = {}
-        piece_id = self.current_piece
-
-        for (x, rotation) in reachable:
-            piece = Tetris.TETROMINOS[piece_id][rotation]
-            drop_y = self._fast_drop_y(piece, x)
-
-            if drop_y >= 0:
-                board = self._add_piece_to_board(piece, [x, drop_y])
-                states[(x, rotation)] = self._get_board_props(board)
-
-        return states
+    def get_game_score(self):
+        return self.score
 
     def get_state_size(self):
-        '''Size of the state: 200 (board) + 30 (per-col) + 8 (aggregate) + 4 (NES) = 242'''
         return 242
+
+    def get_next_states(self):
+        '''Get all reachable next states (filtered by NES physics). Returns dict.'''
+        fpd = np.int32(self._get_fpd())
+        piece_id = np.int32(self.current_piece)
+        reachable = _compute_reachable(piece_id, _TETROMINOS_NP, self.board,
+                                        self._col_tops, fpd)
+
+        states = {}
+        cell_value = np.int32(self.current_piece + 1)
+
+        for idx in range(len(reachable)):
+            x = int(reachable[idx, 0])
+            rot_idx = int(reachable[idx, 1])
+            piece = _TETROMINOS_NP[piece_id, rot_idx]
+            drop_y = _fast_drop_y(piece, np.int32(x), self._col_tops)
+
+            if drop_y >= 0:
+                new_board = _add_piece_to_board(piece, np.int32(x), np.int32(drop_y),
+                                                 self.board, cell_value)
+                lines_cleared, clean_board = _clear_lines(new_board)
+                props = _get_board_props(clean_board, lines_cleared, self.level,
+                                          self.current_piece, self.next_piece, fpd)
+                # Map rotation index back to degrees for action
+                rot_degrees = rot_idx * 90
+                states[(x, rot_degrees)] = props
+
+        return states
 
     def play(self, x, rotation, render=False, render_delay=None):
         '''Makes a play given a position and a rotation — NES scoring and levels'''
         self.current_pos = [x, 0]
         self.current_rotation = rotation
+        rot_idx = rotation // 90
 
-        # ── Count holes BEFORE placing (for delta penalty) ──────
-        holes_before = 0
-        for col in range(Tetris.BOARD_WIDTH):
-            found_block = False
-            for row in range(Tetris.BOARD_HEIGHT):
-                if self.board[row][col] != Tetris.MAP_EMPTY:
-                    found_block = True
-                elif found_block:
-                    holes_before += 1
+        # Count holes BEFORE
+        holes_before = _count_holes(self.board)
 
         if render:
-            # Animated drop for rendering (speed based on NES level)
-            drop_delay = self._get_frames_per_drop() / 60.0  # Convert frames to seconds
-            while not self._check_collision(self._get_rotated_piece(), self.current_pos):
+            drop_delay = self._get_fpd() / 60.0
+            piece_dict = Tetris.TETROMINOS[self.current_piece][rotation]
+            while True:
+                # Check collision using list-based piece for render path
+                collides = False
+                for bx, by in piece_dict:
+                    rx = bx + self.current_pos[0]
+                    ry = by + self.current_pos[1]
+                    if rx < 0 or rx >= 10 or ry < 0 or ry >= 20 or self.board[ry, rx] != 0:
+                        collides = True
+                        break
+                if collides:
+                    break
                 self.render()
                 if render_delay:
                     sleep(render_delay)
                 else:
-                    sleep(max(drop_delay, 0.02))  # Min 20ms for visibility
+                    sleep(max(drop_delay, 0.02))
                 self.current_pos[1] += 1
             self.current_pos[1] -= 1
         else:
-            # Fast drop (training)
-            piece = Tetris.TETROMINOS[self.current_piece][rotation]
-            self.current_pos[1] = self._fast_drop_y(piece, x)
+            piece = _TETROMINOS_NP[self.current_piece, rot_idx]
+            self.current_pos[1] = int(_fast_drop_y(piece, np.int32(x), self._col_tops))
 
-        # Place piece on board
-        self.board = self._add_piece_to_board(self._get_rotated_piece(), self.current_pos)
-        lines_cleared, self.board = self._clear_lines(self.board)
+        # Place piece
+        piece_np = _TETROMINOS_NP[self.current_piece, rot_idx]
+        self.board = _add_piece_to_board(piece_np, np.int32(self.current_pos[0]),
+                                          np.int32(self.current_pos[1]),
+                                          self.board, np.int32(self.current_piece + 1))
+        lines_cleared_i32, self.board = _clear_lines(self.board)
+        lines_cleared = int(lines_cleared_i32)
+        self._col_tops = _recompute_col_tops(self.board)
 
-        # Update column tops
-        self._col_tops = self._recompute_col_tops(self.board)
+        # Count holes AFTER
+        holes_after = int(_count_holes(self.board))
 
-        # ── Count holes AFTER placing ──────────────────────────
-        holes_after = 0
-        for col in range(Tetris.BOARD_WIDTH):
-            found_block = False
-            for row in range(Tetris.BOARD_HEIGHT):
-                if self.board[row][col] != Tetris.MAP_EMPTY:
-                    found_block = True
-                elif found_block:
-                    holes_after += 1
-
-        # ── NES Scoring ────────────────────────────────────────
+        # NES Scoring
         nes_points = Tetris.NES_SCORE_TABLE.get(lines_cleared, 0) * (self.level + 1)
         self.score += nes_points
 
-        # ── Level advancement (every 10 lines) ─────────────────
+        # Level advancement
         if lines_cleared > 0:
             self.total_lines += lines_cleared
             new_level = self.total_lines // 10
             if new_level > self.level:
                 self.level = new_level
 
-        # ── Training reward ─────────────────────────────────────
-        # MUST stay net-positive so the AI learns "survive = good".
-        # The rich state features (per-column holes, wells, transitions)
-        # teach the network to avoid holes WITHOUT needing heavy penalties.
-        #
-        # Reward budget per piece:
-        #   Survival:    +1.0  (always positive baseline)
-        #   Line clears: +4 / +10 / +30 / +120  (NES ratio: Tetris = 30× single)
-        #   Hole delta:  -0.3 per NEW hole (gentle nudge, not crushing)
-        #   Clean board: +0.5  (small bonus for zero holes)
-        #   Game over:   -5.0  (dying is bad)
-        #
-        # Worst case per piece: +1.0 - 0.3×4 = -0.2 (barely negative)
-        # Typical case: +1.0 - 0.3 = +0.7 (still positive, AI wants to survive)
-
-        reward = 1.0  # Survival bonus
-
-        # NES-proportional line clear reward (Tetris = 30× single)
+        # Training reward
+        reward = 1.0
         if lines_cleared > 0:
             nes_base = Tetris.NES_SCORE_TABLE[lines_cleared]
-            reward += nes_base / 10.0  # 4, 10, 30, 120 for 1-4 lines
+            reward += nes_base / 10.0
 
-        # Gentle hole penalty — the state features do the heavy lifting
-        new_holes = holes_after - holes_before
+        new_holes = holes_after - int(holes_before)
         if new_holes > 0:
             reward -= new_holes * 0.3
 
-        # Clean board bonus
         if holes_after == 0:
             reward += 0.5
 
-        # Start new round
         self._new_round()
         if self.game_over:
             reward -= 5.0
@@ -574,33 +594,37 @@ class Tetris:
 
     def render(self):
         '''Renders the current board with NES colors + side panel'''
-        board = self._get_complete_board()
+        # Build complete board with active piece
+        board_render = self.board.copy()
+        rot_idx = self.current_rotation // 90
+        piece = _TETROMINOS_NP[self.current_piece, rot_idx]
+        for i in range(4):
+            bx = int(piece[i, 0]) + self.current_pos[0]
+            by = int(piece[i, 1]) + self.current_pos[1]
+            if 0 <= bx < 10 and 0 <= by < 20:
+                board_render[by, bx] = 8  # MAP_PLAYER
+
         cell_size = 25
-        board_w = Tetris.BOARD_WIDTH * cell_size
-        board_h = Tetris.BOARD_HEIGHT * cell_size
-        panel_w = 160  # Side panel width
+        board_w = 10 * cell_size
+        board_h = 20 * cell_size
+        panel_w = 160
         total_w = board_w + panel_w
 
-        # Build board image with NES colors
         img = np.zeros((board_h, total_w, 3), dtype=np.uint8)
 
-        # Draw board cells
-        for row in range(Tetris.BOARD_HEIGHT):
-            for col in range(Tetris.BOARD_WIDTH):
-                cell = board[row][col]
+        for row in range(20):
+            for col in range(10):
+                cell = int(board_render[row, col])
                 color = Tetris.COLORS.get(cell, (128, 128, 128))
                 y1 = row * cell_size
                 x1 = col * cell_size
                 img[y1:y1+cell_size, x1:x1+cell_size] = color
-                # Grid lines
                 if cell == 0:
                     img[y1, x1:x1+cell_size] = (30, 30, 30)
                     img[y1:y1+cell_size, x1] = (30, 30, 30)
 
-        # Draw side panel (dark background)
         img[:, board_w:] = (20, 20, 20)
 
-        # Side panel text (BGR for cv2)
         font = cv2.FONT_HERSHEY_SIMPLEX
         x_text = board_w + 10
         white = (255, 255, 255)
@@ -615,25 +639,22 @@ class Tetris:
         cv2.putText(img, f'Lines', (x_text, 170), font, 0.4, white, 1)
         cv2.putText(img, f'{self.total_lines}', (x_text, 190), font, 0.5, cyan, 1)
 
-        # Next piece preview
         cv2.putText(img, 'Next', (x_text, 230), font, 0.4, white, 1)
-        next_piece = Tetris.TETROMINOS[self.next_piece][0]
+        next_piece = _TETROMINOS_NP[self.next_piece, 0]
         next_color = Tetris.COLORS.get(self.next_piece + 1, (255, 255, 255))
         preview_size = 12
-        for px, py in next_piece:
-            px_draw = board_w + 15 + px * preview_size
-            py_draw = 245 + py * preview_size
+        for i in range(4):
+            px_draw = board_w + 15 + int(next_piece[i, 0]) * preview_size
+            py_draw = 245 + int(next_piece[i, 1]) * preview_size
             img[py_draw:py_draw+preview_size, px_draw:px_draw+preview_size] = next_color
 
-        # Speed info
-        fpd = self._get_frames_per_drop()
+        fpd = self._get_fpd()
         cv2.putText(img, f'Speed', (x_text, 310), font, 0.4, white, 1)
         cv2.putText(img, f'{fpd} fpd', (x_text, 330), font, 0.5, cyan, 1)
 
         if self.level >= 29:
             cv2.putText(img, 'KILL SCREEN', (x_text, 370), font, 0.4, (0, 0, 255), 1)
 
-        # Convert RGB to BGR for cv2
         img = img[..., ::-1]
         cv2.imshow('NES Tetris AI', img)
         cv2.waitKey(1)
