@@ -273,7 +273,13 @@ class DQNAgent:
         with torch.no_grad():
             td_errors = (predictions - targets).abs() + self.per_epsilon
             self._gpu_priorities[indices] = td_errors
-            self._max_priority = max(self._max_priority, td_errors.max().item())
+            batch_max = td_errors.max().item()
+            # Refresh _max_priority periodically from actual buffer
+            # Prevents stale max from killing acceptance rate
+            if self._train_steps % 1000 == 0:
+                self._max_priority = self._gpu_priorities[:self._mem_count].max().item()
+            else:
+                self._max_priority = max(self._max_priority * 0.99, batch_max)
 
         self.scheduler.step()
         self._train_steps += 1
