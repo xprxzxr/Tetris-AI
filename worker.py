@@ -11,9 +11,6 @@ os.environ['ABSL_MIN_LOG_LEVEL'] = '3'
 
 import numpy as np
 import random
-import torch
-import torch.nn as nn
-from tetris import Tetris
 from multiprocessing import Process, Queue
 from multiprocessing.shared_memory import SharedMemory
 
@@ -47,6 +44,7 @@ def _compute_nstep(experiences, n_step, discount):
 
 def _build_model(state_size, n_neurons, activations):
     '''Build a lightweight CPU model matching the GPU model architecture.'''
+    import torch.nn as nn
     layers = []
     in_size = state_size
     for i, neurons in enumerate(n_neurons):
@@ -69,6 +67,7 @@ def _build_model(state_size, n_neurons, activations):
 
 def _load_weights_from_shm(model, shm_name, weight_shapes, weight_keys):
     '''Load model weights from shared memory block.'''
+    import torch
     try:
         shm = SharedMemory(name=shm_name, create=False)
         offset = 0
@@ -91,6 +90,8 @@ def _worker_loop(task_queue, result_queue, worker_id, shm_name,
                  weight_shapes, weight_keys, state_size, n_neurons, activations,
                  n_step=3, discount=0.95):
     '''Persistent worker with local CPU model. No GPU dependency for inference.'''
+    import torch
+    from tetris import Tetris
     env = Tetris()
     model = _build_model(state_size, n_neurons, activations)
 
