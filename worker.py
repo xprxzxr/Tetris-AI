@@ -91,6 +91,8 @@ def _worker_loop(task_queue, result_queue, worker_id, shm_name,
                  n_step=3, discount=0.95):
     '''Persistent worker with local CPU model. No GPU dependency for inference.'''
     import torch
+    # Each worker gets exactly 1 thread — prevents 28 workers × N threads fighting for cores
+    torch.set_num_threads(1)
     from tetris import Tetris
     env = Tetris()
     model = _build_model(state_size, n_neurons, activations)
