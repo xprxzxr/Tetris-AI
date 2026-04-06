@@ -452,7 +452,7 @@ def dqn(resume_from=None, fast_mode=False):
 
     # ── Resource caps ──────────────────────────────────────────
     if fast_mode:
-        NUM_WORKERS = max(4, mp.cpu_count() - 2)
+        NUM_WORKERS = max(4, mp.cpu_count())
         STEP_THROTTLE = 0
         torch.set_num_threads(mp.cpu_count())
         os.environ['OMP_NUM_THREADS'] = str(mp.cpu_count())
@@ -595,28 +595,54 @@ def dqn(resume_from=None, fast_mode=False):
     gpu_thread.start()
 
     # ── GPU inference thread ──────────────────────────────────────
-    # Workers send (worker_id, states_array) to pool.inference_queue.
-    # This thread runs the model forward pass on GPU and returns best_idx.
+    # Batches multiple workers' requests into ONE forward pass.
+    # Drains the queue each cycle, merges all pending states into a single
+    # tensor, runs one GPU forward pass, then splits results back per-worker.
+    # This keeps the GPU fed with large batches instead of tiny per-worker ones.
     inference_shutdown = threading.Event()
 
     def _gpu_inference_loop():
         device = next(agent.model.parameters()).device
         while not inference_shutdown.is_set():
             try:
+                # Wait for at least one request
                 try:
-                    request = pool.inference_queue.get(timeout=0.05)
+                    first = pool.inference_queue.get(timeout=0.05)
                 except Exception:
                     continue
 
-                worker_id, states_array = request
+                # Drain all pending requests from the queue
+                batch = [first]
+                while True:
+                    try:
+                        batch.append(pool.inference_queue.get_nowait())
+                    except Exception:
+                        break
 
+                # Merge all workers' states into one big tensor
+                worker_ids = []
+                state_counts = []
+                all_states = []
+                for worker_id, states_array in batch:
+                    worker_ids.append(worker_id)
+                    state_counts.append(len(states_array))
+                    all_states.append(states_array)
+
+                merged = np.concatenate(all_states, axis=0)
+
+                # ONE forward pass for all workers
                 with torch.no_grad():
-                    states_tensor = torch.tensor(states_array, dtype=torch.float32,
-                                                  device=device)
-                    predictions = agent.model(states_tensor)
-                    best_idx = int(torch.argmax(predictions).item())
+                    states_tensor = torch.as_tensor(merged, dtype=torch.float32,
+                                                     device=device)
+                    predictions = agent.model(states_tensor).squeeze()
 
-                pool.response_queues[worker_id].put(best_idx)
+                # Split results back to each worker
+                offset = 0
+                for i, count in enumerate(state_counts):
+                    worker_preds = predictions[offset:offset + count]
+                    best_idx = int(torch.argmax(worker_preds).item())
+                    pool.response_queues[worker_ids[i]].put(best_idx)
+                    offset += count
 
             except Exception:
                 if inference_shutdown.is_set():
