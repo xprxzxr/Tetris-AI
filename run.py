@@ -472,9 +472,9 @@ def dqn(resume_from=None, fast_mode=False):
     episodes = 2500000
     max_steps = None
     epsilon_stop_episode = 35000  # Explore for 70% of training
-    mem_size = 200000 if fast_mode else 100000  # Bigger buffer when going full speed
+    mem_size = 500000 if fast_mode else 100000  # Bigger buffer when going full speed
     discount = 0.95  # Focus on near-term rewards (line clears)
-    batch_size = 4096 if fast_mode else 2048  # Bigger batches to saturate GPU
+    batch_size = 32768 if fast_mode else 2048  # Big batches to actually saturate GPU
     render_every = None
     render_delay = None
     log_every = 50
@@ -579,10 +579,11 @@ def dqn(resume_from=None, fast_mode=False):
                     time.sleep(0.1)
 
             # Train a burst of batches
+            epochs_per_step = 4 if fast_mode else 1
             for _ in range(governor.burst):
                 if gpu_shutdown.is_set():
                     return
-                agent.train(batch_size=bs, epochs=1)
+                agent.train(batch_size=bs, epochs=epochs_per_step)
                 gpu_passes[0] += 1
 
             if not fast_mode:
