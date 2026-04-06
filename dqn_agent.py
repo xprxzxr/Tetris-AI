@@ -153,11 +153,15 @@ class DQNAgent:
         if n == 0:
             return
 
-        # Stack into contiguous numpy arrays first, then convert to tensors (fast path)
-        states_t = torch.as_tensor(np.array(self._staging_states, dtype=np.float32), device=DEVICE)
-        next_t = torch.as_tensor(np.array(self._staging_next_states, dtype=np.float32), device=DEVICE)
-        rewards_t = torch.as_tensor(np.array(self._staging_rewards, dtype=np.float32), device=DEVICE)
-        dones_t = torch.as_tensor(np.array(self._staging_dones, dtype=np.bool_), device=DEVICE)
+        # Convert to contiguous numpy, then to GPU tensors in one bulk transfer
+        states_np = np.array(self._staging_states, dtype=np.float32)
+        next_np = np.array(self._staging_next_states, dtype=np.float32)
+        rewards_np = np.array(self._staging_rewards, dtype=np.float32)
+        dones_np = np.array(self._staging_dones, dtype=np.bool_)
+        states_t = torch.from_numpy(states_np).to(DEVICE)
+        next_t = torch.from_numpy(next_np).to(DEVICE)
+        rewards_t = torch.from_numpy(rewards_np).to(DEVICE)
+        dones_t = torch.from_numpy(dones_np).to(DEVICE)
 
         # Bulk write with at most 2 slices for wraparound
         start = self._mem_pos

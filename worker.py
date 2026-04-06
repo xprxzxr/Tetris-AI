@@ -133,7 +133,8 @@ def _worker_loop(task_queue, result_queue, worker_id, shm_name,
                 else:
                     # Local CPU inference — no GPU queue, no blocking
                     with torch.no_grad():
-                        states_t = torch.as_tensor(np.array(states, dtype=np.float32))
+                        states_np = np.stack(states).astype(np.float32)
+                        states_t = torch.from_numpy(states_np)
                         preds = model(states_t)
                         idx = int(torch.argmax(preds).item())
 
