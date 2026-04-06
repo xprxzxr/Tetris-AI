@@ -454,9 +454,8 @@ def dqn(resume_from=None, fast_mode=False):
     GAMES_PER_WORKER = 4  # Simultaneous games per worker process
 
     if fast_mode:
-        # Each worker runs 4 games, so fewer workers needed for same parallelism
-        # But still use most cores — each worker does more CPU work now
-        NUM_WORKERS = max(4, (mp.cpu_count() - 2) // 2)
+        # Each worker runs 4 games — still needs a full core per worker
+        NUM_WORKERS = max(4, mp.cpu_count() - 2)
         STEP_THROTTLE = 0  # No per-step sleep
         # Uncap PyTorch threads for full GPU saturation
         torch.set_num_threads(mp.cpu_count())
