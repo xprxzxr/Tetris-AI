@@ -594,63 +594,42 @@ def dqn(resume_from=None, fast_mode=False):
     gpu_thread = threading.Thread(target=_gpu_train_loop, daemon=True)
     gpu_thread.start()
 
-    # ── GPU inference thread ──────────────────────────────────────
-    # Batches multiple workers' requests into ONE forward pass.
-    # Drains the queue each cycle, merges all pending states into a single
-    # tensor, runs one GPU forward pass, then splits results back per-worker.
-    # This keeps the GPU fed with large batches instead of tiny per-worker ones.
+    # ── GPU inference threads ──────────────────────────────────────
+    # Multiple threads pull from the shared inference queue concurrently.
+    # PyTorch handles concurrent GPU forward passes via CUDA streams.
+    # More threads = less time workers spend blocked waiting for a response.
     inference_shutdown = threading.Event()
+    N_INFERENCE_THREADS = 4
 
     def _gpu_inference_loop():
         device = next(agent.model.parameters()).device
         while not inference_shutdown.is_set():
             try:
-                # Wait for at least one request
                 try:
-                    first = pool.inference_queue.get(timeout=0.05)
+                    request = pool.inference_queue.get(timeout=0.05)
                 except Exception:
                     continue
 
-                # Drain all pending requests from the queue
-                batch = [first]
-                while True:
-                    try:
-                        batch.append(pool.inference_queue.get_nowait())
-                    except Exception:
-                        break
+                worker_id, states_array = request
 
-                # Merge all workers' states into one big tensor
-                worker_ids = []
-                state_counts = []
-                all_states = []
-                for worker_id, states_array in batch:
-                    worker_ids.append(worker_id)
-                    state_counts.append(len(states_array))
-                    all_states.append(states_array)
-
-                merged = np.concatenate(all_states, axis=0)
-
-                # ONE forward pass for all workers
                 with torch.no_grad():
-                    states_tensor = torch.as_tensor(merged, dtype=torch.float32,
+                    states_tensor = torch.as_tensor(states_array, dtype=torch.float32,
                                                      device=device)
-                    predictions = agent.model(states_tensor).squeeze()
+                    predictions = agent.model(states_tensor)
+                    best_idx = int(torch.argmax(predictions).item())
 
-                # Split results back to each worker
-                offset = 0
-                for i, count in enumerate(state_counts):
-                    worker_preds = predictions[offset:offset + count]
-                    best_idx = int(torch.argmax(worker_preds).item())
-                    pool.response_queues[worker_ids[i]].put(best_idx)
-                    offset += count
+                pool.response_queues[worker_id].put(best_idx)
 
             except Exception:
                 if inference_shutdown.is_set():
                     break
                 continue
 
-    inference_thread = threading.Thread(target=_gpu_inference_loop, daemon=True)
-    inference_thread.start()
+    inference_threads = []
+    for _ in range(N_INFERENCE_THREADS):
+        t = threading.Thread(target=_gpu_inference_loop, daemon=True)
+        t.start()
+        inference_threads.append(t)
 
     try:
         # ── Staggered initial dispatch ─────────────────────────────
@@ -751,7 +730,8 @@ def dqn(resume_from=None, fast_mode=False):
         gpu_shutdown.set()
         inference_shutdown.set()
         gpu_thread.join(timeout=5)
-        inference_thread.join(timeout=5)
+        for t in inference_threads:
+            t.join(timeout=5)
         governor.shutdown()
         pool.shutdown()
 
