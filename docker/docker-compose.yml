@@ -1,0 +1,21 @@
+services:
+  tetris-ai:
+    build: .
+    container_name: tetris-ai-trainer
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persist trained models and logs outside the container
+      - ./output:/app/logs
+      - ./models:/app/models
+    environment:
+      - DASHBOARD_PORT=8080
+      - NVIDIA_VISIBLE_DEVICES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped

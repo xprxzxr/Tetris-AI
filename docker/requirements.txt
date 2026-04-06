@@ -1,0 +1,9 @@
+torch
+torchvision
+tensorboard
+opencv-python-headless
+numpy
+Pillow
+tqdm
+nvidia-ml-py
+flask

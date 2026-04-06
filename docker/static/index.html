@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tetris AI - Training Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: #0f0f0f;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+
+        .header {
+            background: #1a1a2e;
+            border-bottom: 2px solid #4fc3f7;
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .header h1 {
+            font-size: 20px;
+            font-weight: 600;
+            color: #4fc3f7;
+        }
+        .header .gpu-name {
+            font-size: 13px;
+            color: #888;
+        }
+        .header .status-dot {
+            width: 10px; height: 10px;
+            border-radius: 50%;
+            background: #4caf50;
+            display: inline-block;
+            margin-right: 6px;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 300px;
+            gap: 16px;
+            padding: 16px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Mobile: stack vertically */
+        @media (max-width: 768px) {
+            .container {
+                grid-template-columns: 1fr;
+                padding: 8px;
+                gap: 10px;
+            }
+            .stats-panel { order: -1; }
+            .chart-card canvas { height: 200px !important; }
+        }
+
+        .charts-col { display: flex; flex-direction: column; gap: 12px; }
+
+        .chart-card {
+            background: #1a1a1a;
+            border-radius: 8px;
+            border: 1px solid #2a2a2a;
+            padding: 12px 16px;
+        }
+        .chart-card h3 {
+            font-size: 13px;
+            color: #888;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .stats-panel {
+            background: #1a1a1a;
+            border-radius: 8px;
+            border: 1px solid #2a2a2a;
+            padding: 16px;
+            height: fit-content;
+            position: sticky;
+            top: 16px;
+        }
+        .stats-panel h2 {
+            font-size: 14px;
+            color: #4fc3f7;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #2a2a2a;
+        }
+
+        .stat-group {
+            margin-bottom: 16px;
+        }
+        .stat-group-title {
+            font-size: 11px;
+            color: #555;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 0;
+        }
+        .stat-label {
+            font-size: 12px;
+            color: #888;
+        }
+        .stat-value {
+            font-size: 14px;
+            font-weight: 600;
+            font-family: 'Consolas', 'SF Mono', monospace;
+        }
+
+        .stat-value.green { color: #81c784; }
+        .stat-value.orange { color: #ffb74d; }
+        .stat-value.red { color: #ef5350; }
+        .stat-value.blue { color: #4fc3f7; }
+        .stat-value.purple { color: #ce93d8; }
+
+        .progress-bar {
+            width: 100%;
+            height: 6px;
+            background: #2a2a2a;
+            border-radius: 3px;
+            margin-top: 12px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #4fc3f7, #81c784);
+            border-radius: 3px;
+            transition: width 0.5s ease;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1><span class="status-dot"></span>Tetris AI - Training Dashboard</h1>
+        <span class="gpu-name" id="gpu-name">--</span>
+    </div>
+
+    <div class="container">
+        <div class="charts-col">
+            <div class="chart-card">
+                <h3>Score Progress</h3>
+                <canvas id="scoreChart" height="180"></canvas>
+            </div>
+            <div class="chart-card">
+                <h3>GPU Utilization</h3>
+                <canvas id="utilChart" height="150"></canvas>
+            </div>
+            <div class="chart-card">
+                <h3>GPU Temperature & Power</h3>
+                <canvas id="tempChart" height="150"></canvas>
+            </div>
+        </div>
+
+        <div class="stats-panel">
+            <h2>Live Stats</h2>
+
+            <div class="stat-group">
+                <div class="stat-group-title">Training</div>
+                <div class="stat-row">
+                    <span class="stat-label">Episode</span>
+                    <span class="stat-value blue" id="s-episode">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Avg Score</span>
+                    <span class="stat-value green" id="s-avg-score">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Best Score</span>
+                    <span class="stat-value green" id="s-best-score">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Epsilon</span>
+                    <span class="stat-value" id="s-epsilon">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Replay Buffer</span>
+                    <span class="stat-value" id="s-memory">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">GPU Passes</span>
+                    <span class="stat-value purple" id="s-gpu-passes">--</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progress-fill" style="width: 0%"></div>
+                </div>
+            </div>
+
+            <div class="stat-group">
+                <div class="stat-group-title">GPU</div>
+                <div class="stat-row">
+                    <span class="stat-label">Utilization</span>
+                    <span class="stat-value" id="s-gpu-util">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Peak Util</span>
+                    <span class="stat-value" id="s-gpu-peak-util">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Temperature</span>
+                    <span class="stat-value" id="s-gpu-temp">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Peak Temp</span>
+                    <span class="stat-value" id="s-gpu-peak-temp">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Power</span>
+                    <span class="stat-value orange" id="s-gpu-power">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Clock</span>
+                    <span class="stat-value" id="s-gpu-clock">--</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">VRAM</span>
+                    <span class="stat-value" id="s-gpu-mem">--</span>
+                </div>
+            </div>
+
+            <div class="stat-group">
+                <div class="stat-group-title">Session</div>
+                <div class="stat-row">
+                    <span class="stat-label">Elapsed</span>
+                    <span class="stat-value blue" id="s-elapsed">--</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ── Chart.js setup ──
+        const chartDefaults = {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: { duration: 300 },
+            plugins: { legend: { labels: { color: '#888', font: { size: 11 } } } },
+            scales: {
+                x: { ticks: { color: '#555', maxTicksLimit: 8 }, grid: { color: '#222' } },
+                y: { ticks: { color: '#555' }, grid: { color: '#222' } },
+            },
+        };
+
+        const scoreChart = new Chart(document.getElementById('scoreChart'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    { label: 'Avg Score', data: [], borderColor: '#4fc3f7', borderWidth: 2, pointRadius: 0, tension: 0.3 },
+                    { label: 'Best Score', data: [], borderColor: '#81c784', borderWidth: 1.5, borderDash: [5, 3], pointRadius: 0, tension: 0.3 },
+                ],
+            },
+            options: { ...chartDefaults },
+        });
+
+        const utilChart = new Chart(document.getElementById('utilChart'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    { label: 'GPU %', data: [], borderColor: '#ffb74d', borderWidth: 2, pointRadius: 0, fill: { target: 'origin', above: 'rgba(255,183,77,0.08)' } },
+                ],
+            },
+            options: {
+                ...chartDefaults,
+                scales: {
+                    ...chartDefaults.scales,
+                    y: { ...chartDefaults.scales.y, min: 0, max: 100 },
+                },
+                plugins: {
+                    ...chartDefaults.plugins,
+                    annotation: {},  // ceiling line drawn manually
+                },
+            },
+        });
+
+        const tempChart = new Chart(document.getElementById('tempChart'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    { label: 'Temp (C)', data: [], borderColor: '#ef5350', borderWidth: 2, pointRadius: 0, yAxisID: 'y' },
+                    { label: 'Power (W)', data: [], borderColor: '#ce93d8', borderWidth: 1.5, pointRadius: 0, yAxisID: 'y1' },
+                ],
+            },
+            options: {
+                ...chartDefaults,
+                scales: {
+                    x: chartDefaults.scales.x,
+                    y: { ...chartDefaults.scales.y, position: 'left', title: { display: true, text: 'C', color: '#555' } },
+                    y1: { ticks: { color: '#555' }, grid: { drawOnChartArea: false }, position: 'right', title: { display: true, text: 'W', color: '#555' } },
+                },
+            },
+        });
+
+        // ── Utility ──
+        function formatTime(sec) {
+            const h = Math.floor(sec / 3600);
+            const m = Math.floor((sec % 3600) / 60);
+            const s = Math.floor(sec % 60);
+            if (h > 0) return `${h}h ${String(m).padStart(2,'0')}m ${String(s).padStart(2,'0')}s`;
+            return `${m}m ${String(s).padStart(2,'0')}s`;
+        }
+
+        function utilColor(val) {
+            if (val >= 0.65) return 'red';
+            if (val >= 0.50) return 'orange';
+            return 'green';
+        }
+
+        // ── Polling ──
+        async function fetchStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const d = await res.json();
+
+                document.getElementById('gpu-name').textContent = d.gpu_name || '--';
+                document.getElementById('s-episode').textContent = `${d.episode.toLocaleString()} / ${d.total_episodes.toLocaleString()}`;
+                document.getElementById('s-avg-score').textContent = d.avg_score.toFixed(1);
+                document.getElementById('s-best-score').textContent = Math.round(d.best_score).toLocaleString();
+                document.getElementById('s-epsilon').textContent = d.epsilon.toFixed(4);
+                document.getElementById('s-memory').textContent = d.memory.toLocaleString();
+                document.getElementById('s-gpu-passes').textContent = d.gpu_passes.toLocaleString();
+
+                const utilEl = document.getElementById('s-gpu-util');
+                utilEl.textContent = (d.gpu_util * 100).toFixed(1) + '%';
+                utilEl.className = 'stat-value ' + utilColor(d.gpu_util);
+
+                document.getElementById('s-gpu-peak-util').textContent = (d.gpu_peak_util * 100).toFixed(1) + '%';
+
+                const tempEl = document.getElementById('s-gpu-temp');
+                tempEl.textContent = Math.round(d.gpu_temp) + ' C';
+                tempEl.className = 'stat-value ' + (d.gpu_temp >= 80 ? 'red' : d.gpu_temp >= 65 ? 'orange' : 'green');
+
+                document.getElementById('s-gpu-peak-temp').textContent = Math.round(d.gpu_peak_temp) + ' C';
+                document.getElementById('s-gpu-power').textContent = d.gpu_power.toFixed(1) + ' W';
+                document.getElementById('s-gpu-clock').textContent = d.gpu_clock + ' MHz';
+                document.getElementById('s-gpu-mem').textContent = `${d.gpu_mem_used.toFixed(1)} / ${d.gpu_mem_total.toFixed(1)} GB`;
+                document.getElementById('s-elapsed').textContent = formatTime(d.elapsed);
+
+                const pct = d.total_episodes > 0 ? (d.episode / d.total_episodes * 100) : 0;
+                document.getElementById('progress-fill').style.width = pct + '%';
+            } catch (e) {}
+        }
+
+        async function fetchHistory() {
+            try {
+                const res = await fetch('/api/history');
+                const h = await res.json();
+
+                // Score chart
+                scoreChart.data.labels = h.episodes;
+                scoreChart.data.datasets[0].data = h.avg_scores;
+                scoreChart.data.datasets[1].data = h.best_scores;
+                scoreChart.update('none');
+
+                // GPU util chart — use timestamps, convert to seconds labels
+                const utilLabels = h.timestamps.map(t => Math.round(t) + 's');
+                utilChart.data.labels = utilLabels;
+                utilChart.data.datasets[0].data = h.gpu_utils.map(v => (v * 100).toFixed(1));
+                utilChart.update('none');
+
+                // Temp/power chart
+                tempChart.data.labels = utilLabels;
+                tempChart.data.datasets[0].data = h.gpu_temps;
+                tempChart.data.datasets[1].data = h.gpu_powers;
+                tempChart.update('none');
+            } catch (e) {}
+        }
+
+        // Poll every 1 second for stats, every 2 seconds for chart history
+        setInterval(fetchStats, 1000);
+        setInterval(fetchHistory, 2000);
+        fetchStats();
+        fetchHistory();
+    </script>
+</body>
+</html>
