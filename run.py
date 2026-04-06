@@ -480,8 +480,8 @@ def dqn(resume_from=None, fast_mode=False):
     render_delay = None
     log_every = 50
     replay_start_size = 5000  # More diverse initial buffer
-    n_neurons = [512, 512, 256]
-    activations = ['relu', 'relu', 'relu', 'linear']
+    n_neurons = [2048, 1536, 768, 384]
+    activations = ['relu', 'relu', 'relu', 'relu', 'linear']
     lr = 1e-3
     save_best_model = True
 
