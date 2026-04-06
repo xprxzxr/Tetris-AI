@@ -153,11 +153,11 @@ class DQNAgent:
         if n == 0:
             return
 
-        # Build CPU tensors (done OUTSIDE any lock ideally)
-        states_t = torch.tensor(self._staging_states, dtype=torch.float32, device=DEVICE)
-        next_t = torch.tensor(self._staging_next_states, dtype=torch.float32, device=DEVICE)
-        rewards_t = torch.tensor(self._staging_rewards, dtype=torch.float32, device=DEVICE)
-        dones_t = torch.tensor(self._staging_dones, dtype=torch.bool, device=DEVICE)
+        # Stack into contiguous numpy arrays first, then convert to tensors (fast path)
+        states_t = torch.as_tensor(np.array(self._staging_states, dtype=np.float32), device=DEVICE)
+        next_t = torch.as_tensor(np.array(self._staging_next_states, dtype=np.float32), device=DEVICE)
+        rewards_t = torch.as_tensor(np.array(self._staging_rewards, dtype=np.float32), device=DEVICE)
+        dones_t = torch.as_tensor(np.array(self._staging_dones, dtype=np.bool_), device=DEVICE)
 
         # Bulk write with at most 2 slices for wraparound
         start = self._mem_pos
