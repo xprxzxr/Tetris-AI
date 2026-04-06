@@ -479,7 +479,7 @@ def dqn(resume_from=None, fast_mode=False):
     episodes = 2500000
     max_steps = None
     epsilon_stop_episode = 35000  # Explore for 70% of training
-    mem_size = 2000000 if fast_mode else 100000  # 2M entries — 3090 has 24GB VRAM to spare
+    mem_size = 200000 if fast_mode else 100000  # 200K entries — keeps flush_to_gpu fast
     discount = 0.95  # Focus on near-term rewards (line clears)
     n_step = 3  # N-step returns — propagates reward 3 steps back per update
     batch_size = 8192 if fast_mode else 2048  # Larger batches saturate GPU compute
@@ -590,7 +590,7 @@ def dqn(resume_from=None, fast_mode=False):
     if fast_mode:
         # Fast mode: lock GPU clocks HIGH so it never downclocks between bursts
         # RTX 3090: ~1800 MHz core, 9751 MHz memory
-        governor = GPUGovernor(target_high=1.0, burst=200, cooldown=0.0,
+        governor = GPUGovernor(target_high=1.0, burst=50, cooldown=0.0,
                                batch_size=batch_size,
                                clock_min=1700, clock_max=1900,
                                mem_clock_min=9501, mem_clock_max=9751)
@@ -620,12 +620,11 @@ def dqn(resume_from=None, fast_mode=False):
                         break
                     time.sleep(0.1)
 
-            # Train a burst of batches — epochs=4 replays each batch 4× to keep
-            # the small model busy on the GPU (400K params finishes too fast otherwise)
+            # Train a burst of batches
             for _ in range(governor.burst):
                 if gpu_shutdown.is_set():
                     return
-                agent.train(batch_size=bs, epochs=4)
+                agent.train(batch_size=bs, epochs=1)
                 gpu_passes[0] += 1
 
             if not fast_mode:
@@ -637,7 +636,7 @@ def dqn(resume_from=None, fast_mode=False):
     gpu_thread.start()
 
     # Weight sync tracking — push new weights to workers periodically
-    _weight_sync_interval = 50  # Sync every N collections
+    _weight_sync_interval = 200  # Sync every N collections
     _collections_since_sync = [0]
 
     try:
