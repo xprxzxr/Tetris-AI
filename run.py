@@ -551,7 +551,7 @@ def dqn(resume_from=None, fast_mode=False):
     if fast_mode:
         # Fast mode: lock GPU clocks HIGH so it never downclocks between bursts
         # RTX 3090: ~1800 MHz core, 9751 MHz memory
-        governor = GPUGovernor(target_high=1.0, burst=100, cooldown=0.0,
+        governor = GPUGovernor(target_high=1.0, burst=200, cooldown=0.0,
                                batch_size=batch_size,
                                clock_min=1700, clock_max=1900,
                                mem_clock_min=9501, mem_clock_max=9751)
@@ -581,11 +581,12 @@ def dqn(resume_from=None, fast_mode=False):
                         break
                     time.sleep(0.1)
 
-            # Train a burst of batches
+            # Train a burst of batches — epochs=4 replays each batch 4× to keep
+            # the small model busy on the GPU (400K params finishes too fast otherwise)
             for _ in range(governor.burst):
                 if gpu_shutdown.is_set():
                     return
-                agent.train(batch_size=bs, epochs=1)
+                agent.train(batch_size=bs, epochs=4)
                 gpu_passes[0] += 1
 
             if not fast_mode:
