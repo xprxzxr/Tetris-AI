@@ -466,6 +466,16 @@ def dqn(resume_from=None, fast_mode=False):
     print(f"[CPU] {NUM_WORKERS} workers × {EPISODES_PER_WORKER} eps/dispatch")
 
     env = Tetris()
+    # Warm up Numba JIT cache — one game step compiles all @njit functions
+    # Workers inherit the cache so they don't all compile simultaneously
+    print("[INIT] Warming up Numba JIT cache...")
+    _warmup_state = env.reset()
+    _warmup_ns = env.get_next_states()
+    if _warmup_ns:
+        _wk = list(_warmup_ns.keys())[0]
+        env.play(_wk[0], _wk[1])
+    print("[INIT] Numba JIT ready")
+
     episodes = 2500000
     max_steps = None
     epsilon_stop_episode = 35000  # Explore for 70% of training
