@@ -512,7 +512,10 @@ def dqn(resume_from=None, fast_mode=False):
     episode = start_episode
     pbar = tqdm(total=episodes, initial=start_episode, desc="Training")
 
-    pool = WorkerPool(NUM_WORKERS, step_throttle=STEP_THROTTLE,
+    init_weights = agent.get_weights()
+    pool = WorkerPool(NUM_WORKERS, init_weights,
+                      state_size=env.get_state_size(),
+                      n_neurons=n_neurons, activations=activations,
                       n_step=n_step, discount=discount)
 
     # ── Live Dashboard ───────────────────────────────��──────────────
@@ -594,42 +597,9 @@ def dqn(resume_from=None, fast_mode=False):
     gpu_thread = threading.Thread(target=_gpu_train_loop, daemon=True)
     gpu_thread.start()
 
-    # ── GPU inference threads ──────────────────────────────────────
-    # Multiple threads pull from the shared inference queue concurrently.
-    # PyTorch handles concurrent GPU forward passes via CUDA streams.
-    # More threads = less time workers spend blocked waiting for a response.
-    inference_shutdown = threading.Event()
-    N_INFERENCE_THREADS = 4
-
-    def _gpu_inference_loop():
-        device = next(agent.model.parameters()).device
-        while not inference_shutdown.is_set():
-            try:
-                try:
-                    request = pool.inference_queue.get(timeout=0.05)
-                except Exception:
-                    continue
-
-                worker_id, states_array = request
-
-                with torch.no_grad():
-                    states_tensor = torch.as_tensor(states_array, dtype=torch.float32,
-                                                     device=device)
-                    predictions = agent.model(states_tensor)
-                    best_idx = int(torch.argmax(predictions).item())
-
-                pool.response_queues[worker_id].put(best_idx)
-
-            except Exception:
-                if inference_shutdown.is_set():
-                    break
-                continue
-
-    inference_threads = []
-    for _ in range(N_INFERENCE_THREADS):
-        t = threading.Thread(target=_gpu_inference_loop, daemon=True)
-        t.start()
-        inference_threads.append(t)
+    # Weight sync tracking — push new weights to workers periodically
+    _weight_sync_interval = 50  # Sync every N collections
+    _collections_since_sync = [0]
 
     try:
         # ── Staggered initial dispatch ─────────────────────────────
@@ -651,8 +621,17 @@ def dqn(resume_from=None, fast_mode=False):
             agent.add_batch_to_memory(all_experiences)
             agent.flush_to_gpu()
 
+            # Sync weights periodically so workers use updated model
+            _collections_since_sync[0] += 1
+            sync = False
+            if _collections_since_sync[0] >= _weight_sync_interval:
+                with weights_lock:
+                    pool.update_weights(agent.get_weights())
+                _collections_since_sync[0] = 0
+                sync = True
+
             # Immediately re-dispatch this worker (keeps it busy)
-            pool.dispatch_one(agent.epsilon, EPISODES_PER_WORKER)
+            pool.dispatch_one(agent.epsilon, EPISODES_PER_WORKER, sync_weights=sync)
 
             # Track scores
             scores.extend(ep_scores)
@@ -728,10 +707,7 @@ def dqn(resume_from=None, fast_mode=False):
 
     finally:
         gpu_shutdown.set()
-        inference_shutdown.set()
         gpu_thread.join(timeout=5)
-        for t in inference_threads:
-            t.join(timeout=5)
         governor.shutdown()
         pool.shutdown()
 
