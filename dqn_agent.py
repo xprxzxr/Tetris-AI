@@ -202,50 +202,15 @@ class DQNAgent:
         values = self.model(states_t)
         return states[torch.argmax(values).item()]
 
-    def _per_sample(self, batch_size):
-        '''Cheap PER via rejection sampling — O(batch_size) with zero buffer scans.
-        Oversample uniformly, keep high-priority ones, backfill with uniform.
-        Cost: two randint + one index gather + one comparison. Trivial.'''
-        n = self._mem_count
-
-        # Oversample 3× uniformly
-        oversample = batch_size * 3
-        candidates = torch.randint(0, n, (oversample,), device=DEVICE)
-
-        # Accept candidates proportional to their priority
-        priorities = self._gpu_priorities[candidates]
-        # Acceptance probability = priority / max_priority
-        accept_prob = priorities / (self._max_priority + 1e-8)
-        rand_vals = torch.rand(oversample, device=DEVICE)
-        accepted_mask = rand_vals < accept_prob
-
-        accepted = candidates[accepted_mask]
-
-        if len(accepted) >= batch_size:
-            indices = accepted[:batch_size]
-        else:
-            # Not enough accepted — backfill with uniform random
-            shortfall = batch_size - len(accepted)
-            backfill = torch.randint(0, n, (shortfall,), device=DEVICE)
-            indices = torch.cat([accepted, backfill])
-
-        # IS weights from sampled priorities
-        beta = min(1.0, self.per_beta + (self.per_beta_end - self.per_beta)
-                   * self._train_steps / self.per_beta_anneal)
-        sampled_p = self._gpu_priorities[indices].clamp(min=1e-8)
-        is_weights = (1.0 / sampled_p) ** beta
-        is_weights = is_weights / is_weights.max()
-
-        return indices, is_weights
-
     def train(self, batch_size=32, epochs=1):
-        '''Train on GPU with rank-based PER + n-step + soft target update.'''
+        '''Train on GPU with n-step returns + soft target update.
+        Uniform sampling — fast and stable at any buffer size.'''
         n = self._mem_count
         if n < self.replay_start_size or n < batch_size:
             return
 
-        # ── PER: rank-based segment sampling (fast) ──
-        indices, is_weights = self._per_sample(batch_size)
+        # Uniform random sampling — O(1), zero overhead
+        indices = torch.randint(0, n, (batch_size,), device=DEVICE)
 
         # Index directly into GPU tensors — zero copy
         states = self._gpu_states[indices]
@@ -260,33 +225,19 @@ class DQNAgent:
             targets = torch.where(dones, rewards, rewards + self.discount_n * next_qs)
             predictions = self.model(states).squeeze()
 
-            # PER-weighted loss
-            element_loss = self.loss_fn(predictions, targets)
-            loss = (is_weights * element_loss).mean()
+            loss = self.loss_fn(predictions, targets).mean()
 
             self.optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-        # ── Update priorities ──
-        with torch.no_grad():
-            td_errors = (predictions - targets).abs() + self.per_epsilon
-            self._gpu_priorities[indices] = td_errors
-            batch_max = td_errors.max().item()
-            # Refresh _max_priority periodically from actual buffer
-            # Prevents stale max from killing acceptance rate
-            if self._train_steps % 1000 == 0:
-                self._max_priority = self._gpu_priorities[:self._mem_count].max().item()
-            else:
-                self._max_priority = max(self._max_priority * 0.99, batch_max)
-
         self.scheduler.step()
         self._train_steps += 1
 
-        # Soft (Polyak) target update every 10 steps — amortizes the Python loop cost
+        # Soft (Polyak) target update every 10 steps
         if self._train_steps % 10 == 0:
-            tau = 0.05  # 10× larger tau since we update 10× less often (equivalent smoothing)
+            tau = 0.05
             for p_target, p_online in zip(self.target_model.parameters(), self.model.parameters()):
                 p_target.data.mul_(1.0 - tau).add_(p_online.data * tau)
 

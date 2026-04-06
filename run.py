@@ -451,22 +451,25 @@ def dqn(resume_from=None, fast_mode=False):
         print(f"[CPU] PyTorch threads capped at {pt_threads}")
 
     # ── Resource caps ──────────────────────────────────────────
+    GAMES_PER_WORKER = 4  # Simultaneous games per worker process
+
     if fast_mode:
-        # Use ALL available cores — reserve 2 for main thread + GPU thread
-        NUM_WORKERS = max(4, mp.cpu_count() - 2)
+        # Each worker runs 4 games, so fewer workers needed for same parallelism
+        # But still use most cores — each worker does more CPU work now
+        NUM_WORKERS = max(4, (mp.cpu_count() - 2) // 2)
         STEP_THROTTLE = 0  # No per-step sleep
         # Uncap PyTorch threads for full GPU saturation
         torch.set_num_threads(mp.cpu_count())
         os.environ['OMP_NUM_THREADS'] = str(mp.cpu_count())
         os.environ['MKL_NUM_THREADS'] = str(mp.cpu_count())
-        print(f"[FAST MODE] {NUM_WORKERS} workers, all {mp.cpu_count()} cores, no throttle")
+        print(f"[FAST MODE] {NUM_WORKERS} workers × {GAMES_PER_WORKER} games = "
+              f"{NUM_WORKERS * GAMES_PER_WORKER} simultaneous games, no throttle")
     else:
-        NUM_WORKERS = 4  # More workers for ~70% CPU target
+        NUM_WORKERS = 4
         STEP_THROTTLE = 0.005  # 5ms per step — moderate throttle
-    EPISODES_PER_WORKER = 5 if fast_mode else 3  # More per dispatch = less overhead
+    EPISODES_PER_WORKER = 20 if fast_mode else 8  # More episodes per dispatch
 
-    print(f"[CPU] {NUM_WORKERS} workers × {EPISODES_PER_WORKER} eps "
-          f"= {NUM_WORKERS * EPISODES_PER_WORKER} eps/round")
+    print(f"[CPU] {NUM_WORKERS} workers × {EPISODES_PER_WORKER} eps/dispatch")
 
     env = Tetris()
     episodes = 2500000
@@ -598,9 +601,9 @@ def dqn(resume_from=None, fast_mode=False):
     gpu_thread.start()
 
     # ── GPU inference thread ──────────────────────────────────────
-    # Workers send (worker_id, states_array) to pool.inference_queue.
-    # This thread runs the model forward pass on GPU and returns
-    # the best state index to the worker's response queue.
+    # Workers send (worker_id, states_array, game_counts) to pool.inference_queue.
+    # This thread runs one batched forward pass for all games in a worker,
+    # then splits results by game_counts and returns per-game best indices.
     inference_shutdown = threading.Event()
 
     def _gpu_inference_loop():
@@ -613,17 +616,24 @@ def dqn(resume_from=None, fast_mode=False):
                 except Exception:
                     continue
 
-                worker_id, states_array = request
+                worker_id, states_array, game_counts = request
 
-                # Run forward pass on GPU
+                # Run single forward pass for ALL games in this worker
                 with torch.no_grad():
                     states_tensor = torch.tensor(states_array, dtype=torch.float32,
                                                   device=device)
-                    predictions = agent.model(states_tensor)
-                    best_idx = int(torch.argmax(predictions).item())
+                    predictions = agent.model(states_tensor).squeeze()
 
-                # Return result to the specific worker
-                pool.response_queues[worker_id].put(best_idx)
+                    # Split predictions by game and argmax each
+                    best_indices = []
+                    offset = 0
+                    for count in game_counts:
+                        game_preds = predictions[offset:offset + count]
+                        best_indices.append(int(torch.argmax(game_preds).item()))
+                        offset += count
+
+                # Return per-game best indices to the worker
+                pool.response_queues[worker_id].put(best_indices)
 
             except Exception:
                 if inference_shutdown.is_set():

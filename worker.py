@@ -1,7 +1,7 @@
 '''
 Parallel Tetris workers with GPU-batched inference.
-Workers run Numba-JIT game logic and send candidate states to GPU
-for evaluation instead of running their own CPU models.
+Each worker runs N simultaneous games and batches their GPU inference
+into a single request per step — amortizing queue latency.
 '''
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -13,6 +13,8 @@ import random
 import time as _time
 from tetris import Tetris
 from multiprocessing import Process, Queue
+
+GAMES_PER_WORKER = 4  # Simultaneous games per worker process
 
 
 def _compute_nstep(experiences, n_step, discount):
@@ -44,9 +46,10 @@ def _compute_nstep(experiences, n_step, discount):
 
 def _worker_loop(task_queue, result_queue, inference_queue, response_queues, worker_id,
                  step_throttle=0.0, n_step=3, discount=0.95):
-    '''Persistent worker — plays Tetris games, sends states to GPU for evaluation.
-    No local model. All inference happens on GPU via queues.'''
-    env = Tetris()
+    '''Persistent worker — runs N simultaneous Tetris games.
+    Batches all games\' GPU inference into one request per step.'''
+    n_games = GAMES_PER_WORKER
+    envs = [Tetris() for _ in range(n_games)]
     my_response_queue = response_queues[worker_id]
 
     while True:
@@ -54,25 +57,46 @@ def _worker_loop(task_queue, result_queue, inference_queue, response_queues, wor
         if task is None:
             break
 
-        epsilon, episodes_per_worker = task
+        epsilon, total_episodes = task
 
         all_experiences = []
         all_scores = []
         all_steps = []
+        episodes_done = 0
 
-        for _ in range(episodes_per_worker):
-            current_state = env.reset()
-            done = False
-            steps = 0
-            experiences = []
+        # Per-game state tracking
+        current_states = [None] * n_games
+        game_experiences = [[] for _ in range(n_games)]
+        game_steps = [0] * n_games
 
-            while not done:
-                next_states_dict = env.get_next_states()
+        # Reset all games
+        for g in range(n_games):
+            current_states[g] = envs[g].reset()
 
-                if not next_states_dict:
+        # Step all games simultaneously until we've collected enough episodes
+        while episodes_done < total_episodes:
+            # Phase 1: Generate next states for all active games
+            per_game_data = []  # (game_idx, next_states_dict, states_list, state_to_action)
+            for g in range(n_games):
+                if episodes_done >= total_episodes:
                     break
+                next_states_dict = envs[g].get_next_states()
+                if not next_states_dict:
+                    # Game over — no valid moves
+                    game_experiences[g].append(
+                        (current_states[g], current_states[g], -5.0, True))
+                    # Finish episode
+                    all_experiences.extend(
+                        _compute_nstep(game_experiences[g], n_step, discount))
+                    all_scores.append(envs[g].get_game_score())
+                    all_steps.append(game_steps[g])
+                    episodes_done += 1
+                    # Reset this game
+                    current_states[g] = envs[g].reset()
+                    game_experiences[g] = []
+                    game_steps[g] = 0
+                    continue
 
-                # Flip: {action: state_vec} → {state_tuple: action}
                 state_to_action = {}
                 states_list = []
                 for action, state_vec in next_states_dict.items():
@@ -80,38 +104,80 @@ def _worker_loop(task_queue, result_queue, inference_queue, response_queues, wor
                     state_to_action[state_tuple] = action
                     states_list.append(state_vec)
 
+                per_game_data.append((g, next_states_dict, states_list, state_to_action))
+
+            if not per_game_data:
+                continue
+
+            # Phase 2: Decide actions — batch GPU inference for all games
+            # Separate random (epsilon) games from GPU games
+            random_games = []
+            gpu_games = []
+            for item in per_game_data:
                 if random.random() <= epsilon:
-                    # Random exploration — no GPU needed
-                    best_state = random.choice(list(state_to_action.keys()))
+                    random_games.append(item)
                 else:
-                    # Send to GPU for batch evaluation
-                    states_array = np.array(states_list, dtype=np.float32)
-                    inference_queue.put((worker_id, states_array))
-                    # Block until GPU returns the best index
-                    best_idx = my_response_queue.get()
-                    best_state = tuple(states_list[best_idx])
+                    gpu_games.append(item)
 
-                best_action = state_to_action[best_state]
-                reward, done = env.play(best_action[0], best_action[1])
+            # Handle random selections locally
+            game_actions = {}  # game_idx → (best_state, best_action)
+            for g, nsd, sl, sta in random_games:
+                best_state = random.choice(list(sta.keys()))
+                best_action = sta[best_state]
+                game_actions[g] = (best_state, best_action)
 
-                experiences.append((current_state, best_state, reward, done))
-                current_state = best_state
-                steps += 1
+            # Batch GPU inference for remaining games
+            if gpu_games:
+                all_states = []
+                game_counts = []
+                for g, nsd, sl, sta in gpu_games:
+                    all_states.extend(sl)
+                    game_counts.append(len(sl))
 
-                if step_throttle > 0:
-                    _time.sleep(step_throttle)
+                states_array = np.array(all_states, dtype=np.float32)
+                inference_queue.put((worker_id, states_array, game_counts))
+                best_indices = my_response_queue.get()
 
-            all_experiences.extend(_compute_nstep(experiences, n_step, discount))
-            all_scores.append(env.get_game_score())
-            all_steps.append(steps)
+                # Map GPU results back to per-game actions
+                for i, (g, nsd, sl, sta) in enumerate(gpu_games):
+                    best_idx = best_indices[i]
+                    best_state = tuple(sl[best_idx])
+                    best_action = sta[best_state]
+                    game_actions[g] = (best_state, best_action)
+
+            # Phase 3: Execute actions for all games
+            for g, nsd, sl, sta in per_game_data:
+                if g not in game_actions:
+                    continue
+                best_state, best_action = game_actions[g]
+                reward, done = envs[g].play(best_action[0], best_action[1])
+
+                game_experiences[g].append(
+                    (current_states[g], best_state, reward, done))
+                current_states[g] = best_state
+                game_steps[g] += 1
+
+                if done:
+                    # Episode finished
+                    all_experiences.extend(
+                        _compute_nstep(game_experiences[g], n_step, discount))
+                    all_scores.append(envs[g].get_game_score())
+                    all_steps.append(game_steps[g])
+                    episodes_done += 1
+                    # Reset this game
+                    current_states[g] = envs[g].reset()
+                    game_experiences[g] = []
+                    game_steps[g] = 0
+
+            if step_throttle > 0:
+                _time.sleep(step_throttle)
 
         result_queue.put((all_experiences, all_scores, all_steps))
 
 
 class WorkerPool:
     '''Pool of persistent workers with GPU-batched inference.
-    Workers send candidate states to GPU via inference_queue.
-    GPU inference thread (in run.py) evaluates and returns results.'''
+    Each worker runs N simultaneous games and batches inference.'''
 
     def __init__(self, num_workers, step_throttle=0.0, n_step=3, discount=0.95):
         self.num_workers = num_workers
@@ -119,8 +185,8 @@ class WorkerPool:
         self.result_queue = Queue()
 
         # GPU inference queues
-        self.inference_queue = Queue()  # Workers → GPU: (worker_id, states_array)
-        self.response_queues = [Queue() for _ in range(num_workers)]  # GPU → Workers: best_idx
+        self.inference_queue = Queue()  # Workers → GPU: (worker_id, states_array, game_counts)
+        self.response_queues = [Queue() for _ in range(num_workers)]  # GPU → Workers: best_indices list
 
         self.workers = []
         for i in range(num_workers):
