@@ -203,41 +203,37 @@ class DQNAgent:
         return states[torch.argmax(values).item()]
 
     def _per_sample(self, batch_size):
-        '''Priority sampling using top-k biased random indices.
-        Fast and safe — no sort, no multinomial, no index-out-of-bounds.'''
+        '''Cheap PER via rejection sampling — O(batch_size) with zero buffer scans.
+        Oversample uniformly, keep high-priority ones, backfill with uniform.
+        Cost: two randint + one index gather + one comparison. Trivial.'''
         n = self._mem_count
 
-        # Simple approach: sample with replacement weighted by priority
-        # Use priorities as weights directly with torch.multinomial on a CLAMPED slice
-        priorities = self._gpu_priorities[:n].clamp(min=1e-8)
+        # Oversample 3× uniformly
+        oversample = batch_size * 3
+        candidates = torch.randint(0, n, (oversample,), device=DEVICE)
 
-        # If buffer is small, just use uniform sampling (fast path)
-        if n <= batch_size * 2:
-            indices = torch.randint(0, n, (batch_size,), device=DEVICE)
-            return indices, torch.ones(batch_size, device=DEVICE)
+        # Accept candidates proportional to their priority
+        priorities = self._gpu_priorities[candidates]
+        # Acceptance probability = priority / max_priority
+        accept_prob = priorities / (self._max_priority + 1e-8)
+        rand_vals = torch.rand(oversample, device=DEVICE)
+        accepted_mask = rand_vals < accept_prob
 
-        # Stochastic priority sampling: mix priority-weighted and uniform
-        # Draw half from top priorities, half uniform — fast and effective
-        half = batch_size // 2
+        accepted = candidates[accepted_mask]
 
-        # Top-priority half: sample from top 20% of buffer by priority
-        top_k = max(batch_size, n // 5)
-        top_vals, top_idx = torch.topk(priorities, top_k, sorted=False)
-        chosen = torch.randint(0, top_k, (half,), device=DEVICE)
-        priority_indices = top_idx[chosen]
+        if len(accepted) >= batch_size:
+            indices = accepted[:batch_size]
+        else:
+            # Not enough accepted — backfill with uniform random
+            shortfall = batch_size - len(accepted)
+            backfill = torch.randint(0, n, (shortfall,), device=DEVICE)
+            indices = torch.cat([accepted, backfill])
 
-        # Uniform half: random indices for diversity
-        uniform_indices = torch.randint(0, n, (batch_size - half,), device=DEVICE)
-
-        # Combine
-        indices = torch.cat([priority_indices, uniform_indices])
-
-        # IS weights: priority samples get downweighted, uniform get weight 1.0
+        # IS weights from sampled priorities
         beta = min(1.0, self.per_beta + (self.per_beta_end - self.per_beta)
                    * self._train_steps / self.per_beta_anneal)
-        sampled_priorities = priorities[indices]
-        mean_priority = priorities.mean()
-        is_weights = (mean_priority / sampled_priorities) ** beta
+        sampled_p = self._gpu_priorities[indices].clamp(min=1e-8)
+        is_weights = (1.0 / sampled_p) ** beta
         is_weights = is_weights / is_weights.max()
 
         return indices, is_weights
