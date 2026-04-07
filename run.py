@@ -543,7 +543,7 @@ def dqn(resume_from=None, fast_mode=False):
     # This guarantees a fixed training-to-data ratio (no GIL contention).
     weights_lock = threading.Lock()
     gpu_passes = [0]
-    TRAIN_PER_EXP = 0.25  # 1 gradient step per 4 new experiences (replay ratio ~8 with bs=512)
+    TRAIN_PER_EXP = 0.04  # ~10 train steps per collection (10x more than old thread)
 
     # GPU governor — thermal monitoring + clock management
     if fast_mode:
