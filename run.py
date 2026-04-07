@@ -482,13 +482,13 @@ def dqn(resume_from=None, fast_mode=False):
     mem_size = 200000 if fast_mode else 100000  # 200K entries — keeps flush_to_gpu fast
     discount = 0.95  # Focus on near-term rewards (line clears)
     n_step = 3  # N-step returns — propagates reward 3 steps back per update
-    batch_size = 2048  # Sweet spot for 400K param model
+    batch_size = 512  # Smaller model (5K params) → smaller batch, more updates
     render_every = None
     render_delay = None
     log_every = 50
     replay_start_size = 5000  # More diverse initial buffer
-    n_neurons = [512, 512, 256]
-    activations = ['relu', 'relu', 'relu', 'linear']
+    n_neurons = [64, 64]
+    activations = ['relu', 'relu', 'linear']
     lr = 1e-3
     save_best_model = True
 
@@ -538,29 +538,15 @@ def dqn(resume_from=None, fast_mode=False):
         'gpu_power': 0, 'gpu_clock': 0,
     }
 
-    # ── Persistent GPU training thread ──────────────────────────────
-    # Runs for the ENTIRE session. Never stops until shutdown.
-    # NO LOCK on the training hot path!
-    # Safety: train() reads random indices < _mem_count,
-    #         flush_to_gpu() writes to [_mem_pos..+n) then bumps _mem_count.
-    #         Training never sees half-written data because _mem_count is
-    #         updated AFTER the bulk write completes.
-    # weights_lock: brief lock ONLY for save_model/save_checkpoint (GPU→CPU sync).
+    # ── Inline GPU training ──────────────────────────────────────────
+    # Train synchronously after each data collection.
+    # This guarantees a fixed training-to-data ratio (no GIL contention).
     weights_lock = threading.Lock()
-    gpu_shutdown = threading.Event()
     gpu_passes = [0]
+    TRAIN_PER_EXP = 0.25  # 1 gradient step per 4 new experiences (replay ratio ~8 with bs=512)
 
-    # GPU governor — fixed params with hard utilization ceiling + thermal monitoring
-    # clock_min/clock_max: lock GPU core clock range in MHz (requires admin/root)
-    #   Example: clock_min=800, clock_max=1500 for 800-1500 MHz
-    #   Set both equal for a perfectly flat clock: clock_min=1200, clock_max=1200
-    #   Set to None to leave clocks at default (GPU boosts freely)
-    # mem_clock_min/mem_clock_max: lock VRAM clock range in MHz
-    #   RTX 4070 VRAM typically: 405-10501 MHz
-    #   Example: mem_clock_min=5001, mem_clock_max=5001 for fixed VRAM speed
+    # GPU governor — thermal monitoring + clock management
     if fast_mode:
-        # Fast mode: lock GPU clocks HIGH so it never downclocks between bursts
-        # RTX 3090: ~1800 MHz core, 9751 MHz memory
         governor = GPUGovernor(target_high=1.0, burst=50, cooldown=0.0,
                                batch_size=batch_size,
                                clock_min=1700, clock_max=1900,
@@ -576,35 +562,8 @@ def dqn(resume_from=None, fast_mode=False):
     dash_thread = threading.Thread(target=dashboard.run, daemon=True)
     dash_thread.start()
 
-    def _gpu_train_loop():
-        while not gpu_shutdown.is_set():
-            n = agent._mem_count
-            bs = governor.batch_size
-            if n < replay_start_size or n < bs:
-                time.sleep(0.1)
-                continue
-
-            if not fast_mode:
-                # ── HARD CEILING: block until GPU drops below target_high ──
-                while not gpu_shutdown.is_set():
-                    if not governor.at_ceiling():
-                        break
-                    time.sleep(0.1)
-
-            # Train a burst of batches
-            for _ in range(governor.burst):
-                if gpu_shutdown.is_set():
-                    return
-                agent.train(batch_size=bs, epochs=1)
-                gpu_passes[0] += 1
-
-            if not fast_mode:
-                torch.cuda.synchronize()
-                time.sleep(governor.cooldown)
-            governor.update()
-
-    gpu_thread = threading.Thread(target=_gpu_train_loop, daemon=True)
-    gpu_thread.start()
+    # Running training debt — ensures we never skip training
+    _train_debt = 0.0
 
     # Weight sync tracking
     _weight_sync_interval = 20  # Update shared memory every 20 collections
@@ -620,15 +579,27 @@ def dqn(resume_from=None, fast_mode=False):
 
         # ── Rolling collection loop ────────────────────────────────
         # Process results one worker at a time. As each finishes,
-        # immediately re-dispatch it. Workers are always staggered,
-        # so CPU load stays flat — no burst/idle/burst pattern.
+        # immediately re-dispatch it. Then do inline GPU training
+        # proportional to new data — guarantees training ratio.
         while episode < episodes:
             # Wait for ONE worker to finish
             all_experiences, ep_scores, ep_steps = pool.collect_one()
 
             # Ingest this worker's experiences
+            n_new = len(all_experiences)
             agent.add_batch_to_memory(all_experiences)
             agent.flush_to_gpu()
+
+            # ── Inline GPU training ────────────────────────────────
+            # Train proportionally to new data. Accumulate fractional
+            # debt so we never skip training even for small batches.
+            _train_debt += n_new * TRAIN_PER_EXP
+            n_trains = int(_train_debt)
+            if n_trains > 0 and agent._mem_count >= replay_start_size:
+                for _ in range(n_trains):
+                    agent.train(batch_size=batch_size, epochs=1)
+                    gpu_passes[0] += 1
+                _train_debt -= n_trains
 
             # Periodically write new weights to shared memory
             _collections_since_sync[0] += 1
@@ -683,6 +654,7 @@ def dqn(resume_from=None, fast_mode=False):
                         agent.save_model("best.pt")
 
             # ── Dashboard + logging ─────────────────────────────────
+            governor.update()
             recent_avg = mean(scores[-50:]) if scores else 0
             dashboard_data.update({
                 'episode': episode,
@@ -708,7 +680,8 @@ def dqn(resume_from=None, fast_mode=False):
                 pbar.set_postfix_str(
                     f"avg={avg_score:.0f} best={best_score:.0f} "
                     f"eps={agent.epsilon:.3f} mem={agent._mem_len()} "
-                    f"passes={gpu_passes[0]} | {governor.status()}"
+                    f"passes={gpu_passes[0]} loss={agent._last_loss:.4f} "
+                    f"pred={agent._last_avg_pred:.2f} | {governor.status()}"
                 )
 
             # ── Auto-save checkpoint every 500 episodes ────────────
@@ -717,8 +690,6 @@ def dqn(resume_from=None, fast_mode=False):
                     agent.save_checkpoint("checkpoint.pt", episode, best_score)
 
     finally:
-        gpu_shutdown.set()
-        gpu_thread.join(timeout=5)
         governor.shutdown()
         pool.shutdown()
 

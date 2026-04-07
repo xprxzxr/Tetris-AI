@@ -276,14 +276,10 @@ def _count_holes(board):
 
 @njit(cache=True)
 def _get_board_props(board, lines_cleared, level, current_piece, next_piece, fpd):
-    '''Compute 242-float state vector from board. All numpy, all fast.'''
-    result = np.zeros(242, dtype=np.float64)
-
-    # [0..199] Board binary
-    for row in range(_H):
-        for col in range(_W):
-            if board[row, col] != 0:
-                result[row * _W + col] = 1.0
+    '''Compute 42-float state vector from board — engineered features only.
+    No raw board binary — just the signals that matter for Tetris:
+    column heights, holes, wells, bumpiness, transitions, etc.'''
+    result = np.zeros(42, dtype=np.float64)
 
     # Per-column analysis
     col_heights = np.zeros(_W, dtype=np.int32)
@@ -372,30 +368,44 @@ def _get_board_props(board, lines_cleared, level, current_piece, next_piece, fpd
         if board[_H - 1, col] == 0:
             col_trans += 1
 
-    # Assemble features [200..241]
+    # Assemble all 42 features
     H_f = np.float64(_H)
     W_f = np.float64(_W)
 
+    # [0..9] Column heights (normalized)
     for col in range(_W):
-        result[200 + col] = col_heights[col] / H_f
+        result[col] = col_heights[col] / H_f
+    # [10..19] Column holes (normalized)
     for col in range(_W):
-        result[210 + col] = col_holes[col] / H_f
+        result[10 + col] = col_holes[col] / H_f
+    # [20..29] Column wells (normalized)
     for col in range(_W):
-        result[220 + col] = col_wells[col] / H_f
+        result[20 + col] = col_wells[col] / H_f
 
-    result[230] = np.float64(lines_cleared)
-    result[231] = np.float64(total_holes) / (W_f * H_f)
-    result[232] = np.float64(total_bumpiness) / H_f
-    result[233] = np.float64(sum_height) / (W_f * H_f)
-    result[234] = np.float64(max_height) / H_f
-    result[235] = tetris_ready
-    result[236] = np.float64(row_trans) / (H_f * (W_f + 1.0))
-    result[237] = np.float64(col_trans) / (W_f * H_f)
-
-    result[238] = np.float64(level) / 29.0
-    result[239] = np.float64(fpd) / 48.0
-    result[240] = np.float64(current_piece) / 6.0
-    result[241] = np.float64(next_piece) / 6.0
+    # [30] Lines cleared by this placement (0-4)
+    result[30] = np.float64(lines_cleared)
+    # [31] Total holes (normalized)
+    result[31] = np.float64(total_holes) / (W_f * H_f)
+    # [32] Total bumpiness (normalized)
+    result[32] = np.float64(total_bumpiness) / H_f
+    # [33] Aggregate height (normalized)
+    result[33] = np.float64(sum_height) / (W_f * H_f)
+    # [34] Max column height (normalized)
+    result[34] = np.float64(max_height) / H_f
+    # [35] Tetris ready (binary)
+    result[35] = tetris_ready
+    # [36] Row transitions (normalized)
+    result[36] = np.float64(row_trans) / (H_f * (W_f + 1.0))
+    # [37] Column transitions (normalized)
+    result[37] = np.float64(col_trans) / (W_f * H_f)
+    # [38] Level (normalized)
+    result[38] = np.float64(level) / 29.0
+    # [39] Frames per drop (normalized)
+    result[39] = np.float64(fpd) / 48.0
+    # [40] Current piece (normalized)
+    result[40] = np.float64(current_piece) / 6.0
+    # [41] Next piece (normalized)
+    result[41] = np.float64(next_piece) / 6.0
 
     return result
 
@@ -486,7 +496,7 @@ class Tetris:
         return self.score
 
     def get_state_size(self):
-        return 242
+        return 42
 
     def get_next_states(self):
         '''Get all reachable next states (filtered by NES physics). Returns dict.'''

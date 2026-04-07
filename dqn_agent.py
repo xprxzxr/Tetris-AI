@@ -102,9 +102,9 @@ class DQNAgent:
         self._train_steps = 0
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
-        # Cosine anneal over ~200k train() calls — never fully kills the LR
+        # Cosine anneal over ~2M train() calls — slow LR decay for long runs
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=200000, eta_min=1e-5
+            self.optimizer, T_max=2000000, eta_min=1e-5
         )
         self.loss_fn = nn.SmoothL1Loss(reduction='none')  # Element-wise for PER weighting
 
@@ -127,6 +127,10 @@ class DQNAgent:
         # Cached weights
         self._cached_weights = None
         self._weights_dirty = True
+
+        # Loss tracking
+        self._last_loss = 0.0
+        self._last_avg_pred = 0.0
 
     def _mem_len(self):
         return self._mem_count
@@ -236,8 +240,13 @@ class DQNAgent:
             nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-        self.scheduler.step()
+        # Track loss for logging (every 1000 steps to avoid overhead)
         self._train_steps += 1
+        if self._train_steps % 1000 == 0:
+            self._last_loss = loss.item()
+            self._last_avg_pred = predictions.mean().item()
+
+        self.scheduler.step()
 
         # Soft (Polyak) target update every 10 steps
         if self._train_steps % 10 == 0:

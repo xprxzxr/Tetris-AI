@@ -12,8 +12,8 @@ from tetris import Tetris
 
 env = Tetris()
 agent = DQNAgent(env.get_state_size(),
-                 n_neurons=[512, 512, 256],
-                 activations=['relu', 'relu', 'relu', 'linear'],
+                 n_neurons=[64, 64],
+                 activations=['relu', 'relu', 'linear'],
                  modelFile=args.model)
 
 # Speed multiplier: 2 = twice as fast, 10 = 10x fast, 0.5 = half speed
