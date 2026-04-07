@@ -606,8 +606,8 @@ def dqn(resume_from=None, fast_mode=False):
     gpu_thread = threading.Thread(target=_gpu_train_loop, daemon=True)
     gpu_thread.start()
 
-    # Weight sync tracking — push new weights to workers periodically
-    _weight_sync_interval = 100  # Sync every N collections (~2500 episodes)
+    # Weight sync tracking
+    _weight_sync_interval = 20  # Update shared memory every 20 collections
     _collections_since_sync = [0]
 
     try:
@@ -630,21 +630,19 @@ def dqn(resume_from=None, fast_mode=False):
             agent.add_batch_to_memory(all_experiences)
             agent.flush_to_gpu()
 
-            # Periodically sync GPU model weights to workers
+            # Periodically write new weights to shared memory
             _collections_since_sync[0] += 1
-            sync = False
             if _collections_since_sync[0] >= _weight_sync_interval:
                 with weights_lock:
                     pool.update_weights(agent.get_weights())
                 _collections_since_sync[0] = 0
-                sync = True
 
             # Compute epsilon based on episode count, not train steps
             epsilon = max(0.01, 1.0 - (episode / epsilon_stop_episode) * (1.0 - 0.01))
             agent.epsilon = epsilon  # Keep agent in sync for logging
 
-            # Immediately re-dispatch this worker (keeps it busy)
-            pool.dispatch_one(epsilon, EPISODES_PER_WORKER, sync_weights=sync)
+            # Re-dispatch — workers always read fresh weights from shared memory
+            pool.dispatch_one(epsilon, EPISODES_PER_WORKER, sync_weights=True)
 
             # Track scores
             scores.extend(ep_scores)
