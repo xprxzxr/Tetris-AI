@@ -639,8 +639,12 @@ def dqn(resume_from=None, fast_mode=False):
                 _collections_since_sync[0] = 0
                 sync = True
 
+            # Compute epsilon based on episode count, not train steps
+            epsilon = max(0.01, 1.0 - (episode / epsilon_stop_episode) * (1.0 - 0.01))
+            agent.epsilon = epsilon  # Keep agent in sync for logging
+
             # Immediately re-dispatch this worker (keeps it busy)
-            pool.dispatch_one(agent.epsilon, EPISODES_PER_WORKER, sync_weights=sync)
+            pool.dispatch_one(epsilon, EPISODES_PER_WORKER, sync_weights=sync)
 
             # Track scores
             scores.extend(ep_scores)

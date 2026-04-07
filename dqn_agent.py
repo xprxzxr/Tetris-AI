@@ -245,9 +245,7 @@ class DQNAgent:
             for p_target, p_online in zip(self.target_model.parameters(), self.model.parameters()):
                 p_target.data.mul_(1.0 - tau).add_(p_online.data * tau)
 
-        if self.epsilon > self.epsilon_min:
-            self.epsilon -= self.epsilon_decay
-
+        # Epsilon decay handled by run.py based on episode count
         self._weights_dirty = True
 
     def save_model(self, name):
